@@ -1,16 +1,21 @@
-// bb-plugin-handoff — pass a whole session to another agent, across providers.
+// bb-plugin-handoff — move a session between agents, in both directions.
 //
-// Capture a thread's full transcript from bb's provider-independent event log,
-// render a handoff document, and spawn a new thread on any installed provider
-// (Codex, Claude Code, Cursor, …) seeded with it.
+// Out: capture a bb thread's full transcript from bb's provider-independent
+// event log, render a handoff document, and spawn a new thread on any
+// installed provider (Codex, Claude Code, Cursor, …) seeded with it.
+// In ("adopt", see adopt/): take a session that ran OUTSIDE bb — Claude Code,
+// Codex, or Gemini CLI — and continue it as a bb thread.
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
+import { adoptCommandSpecs, runAdoptCli } from "./adopt/cli";
+import { adoptRpcShape, createAdoptRpcHandlers } from "./adopt/rpc";
 import { captureThread } from "./capture";
 import { listHandoffs, renderHandoff, startHandoff, type WorkspaceMode } from "./handoff";
 
 const workspaceModeSchema = z.enum(["reuse", "worktree", "personal"]);
 
 export const rpcContract = defineRpcContract({
+  ...adoptRpcShape,
   prepareHandoff: {
     input: z.object({ threadId: z.string() }).strict(),
     output: z.object({
@@ -90,6 +95,7 @@ async function environmentIdOfThread(bb: BbPluginApi, threadId: string): Promise
 
 export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
+    ...createAdoptRpcHandlers(bb),
     async prepareHandoff({ threadId }) {
       const captured = await captureThread(bb, threadId);
       const doc = renderHandoff(captured, new Date());
@@ -161,8 +167,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.cli.register({
     name: "handoff",
-    summary: "Pass a whole session to another agent, across providers",
+    summary: "Move a session between agents — hand off a bb thread, or adopt an external one",
     commands: [
+      ...adoptCommandSpecs,
       {
         name: "start",
         summary: "Capture a thread and spawn a new thread on another provider seeded with it",
@@ -182,6 +189,11 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "list", summary: "Show past handoffs", usage: "bb handoff list" },
     ],
     async run(argv, ctx) {
+      // The adopt direction owns its own argv grammar (ids, resume commands,
+      // --cwd/--agent/…), so it is dispatched before handoff's flag parsing.
+      if (argv[0] === "adopt") {
+        return runAdoptCli(bb, argv.slice(1), { cwd: ctx.cwd, threadId: ctx.threadId });
+      }
       const fail = (message: string) => ({ exitCode: 1, stderr: `${message}\n` });
       const flags = new Map<string, string>();
       const positional: string[] = [];
@@ -275,7 +287,7 @@ export default async function plugin(bb: BbPluginApi) {
         };
       }
 
-      return fail(`Unknown command "${command}". Commands: start, export, targets, list.`);
+      return fail(`Unknown command "${command}". Commands: start, export, targets, list, adopt.`);
     },
   });
 

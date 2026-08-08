@@ -29,6 +29,10 @@
   "include": [
     "server.ts",
     "app.tsx",
+    "adopt",
+    "capture.ts",
+    "handoff.ts",
+    "tests",
     "types",
     "components",
     "lib",
