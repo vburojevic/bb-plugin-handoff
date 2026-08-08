@@ -168,6 +168,7 @@ describe("renderHandoff", () => {
     eventCount: 12,
     latestOutput: "All tests green.",
     nativeSessionPath: "/Users/dev/.claude/projects/-Users-dev-work/abc.jsonl",
+    untilSeq: null,
   };
 
   it("renders header, latest result, and transcript", () => {
@@ -186,6 +187,12 @@ describe("renderHandoff", () => {
   it("notes a missing native session file", () => {
     const doc = renderHandoff({ ...captured, nativeSessionPath: null }, new Date());
     expect(doc).toContain("(not found)");
+  });
+
+  it("marks a partial capture scoped to a selected message", () => {
+    const doc = renderHandoff({ ...captured, untilSeq: 7 }, new Date());
+    expect(doc).toContain("partial capture");
+    expect(doc).toContain("seq 7");
   });
 });
 

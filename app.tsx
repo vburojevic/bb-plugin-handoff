@@ -168,9 +168,33 @@ function RouteChip({
   );
 }
 
-function HandoffPanel({ threadId }: { threadId: string }) {
+interface HandoffScope {
+  upToSeq: number;
+  messagePreview: string;
+  messageRole: "user" | "assistant";
+}
+
+/** Parse the params a messageAction's openPanel call handed this tab. */
+function parseScope(params: unknown): HandoffScope | null {
+  if (!params || typeof params !== "object") return null;
+  const record = params as Record<string, unknown>;
+  const upToSeq = record.upToSeq;
+  if (typeof upToSeq !== "number" || !Number.isInteger(upToSeq) || upToSeq <= 0) return null;
+  return {
+    upToSeq,
+    messagePreview: typeof record.messagePreview === "string" ? record.messagePreview : "",
+    messageRole: record.messageRole === "user" ? "user" : "assistant",
+  };
+}
+
+function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
+
+  const initialScope = useMemo(() => parseScope(params), [params]);
+  const [scopeCleared, setScopeCleared] = useState(false);
+  const scope = scopeCleared ? null : initialScope;
+  const upToSeq = scope?.upToSeq;
 
   const [stats, setStats] = useState<PrepStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
@@ -198,7 +222,7 @@ function HandoffPanel({ threadId }: { threadId: string }) {
     setStats(null);
     setStatsError(null);
     rpc
-      .call("prepareHandoff", { threadId })
+      .call("prepareHandoff", { threadId, upToSeq })
       .then((result) => {
         if (cancelled) return;
         setStats(result);
@@ -218,7 +242,7 @@ function HandoffPanel({ threadId }: { threadId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [rpc, threadId, retryNonce]);
+  }, [rpc, threadId, retryNonce, upToSeq]);
 
   useEffect(() => {
     if (!providerId) return;
@@ -247,14 +271,20 @@ function HandoffPanel({ threadId }: { threadId: string }) {
     [providers, stats],
   );
 
+  // A scope change (cleared banner) invalidates any cached preview.
+  useEffect(() => {
+    setPreview(null);
+    setPreviewError(false);
+  }, [upToSeq]);
+
   const openPreview = useCallback(() => {
     setPreviewOpen(true);
     if (preview || previewError) return;
     rpc
-      .call("previewHandoff", { threadId })
+      .call("previewHandoff", { threadId, upToSeq })
       .then(setPreview)
       .catch(() => setPreviewError(true));
-  }, [rpc, threadId, preview, previewError]);
+  }, [rpc, threadId, upToSeq, preview, previewError]);
 
   const start = useCallback(async () => {
     if (!providerId) return;
@@ -267,6 +297,7 @@ function HandoffPanel({ threadId }: { threadId: string }) {
         ...(model !== "__default__" ? { model } : {}),
         workspace,
         ...(instructions.trim() ? { extraInstructions: instructions.trim() } : {}),
+        ...(upToSeq ? { upToSeq } : {}),
       });
       toast.success(`Handed off to ${selectedProvider?.displayName ?? providerId}`);
       navigate.toThread(result.newThreadId);
@@ -275,7 +306,7 @@ function HandoffPanel({ threadId }: { threadId: string }) {
       setPending(false);
       setStage(null);
     }
-  }, [rpc, threadId, providerId, model, workspace, instructions, navigate, selectedProvider]);
+  }, [rpc, threadId, providerId, model, workspace, instructions, upToSeq, navigate, selectedProvider]);
 
   const stageIndex = STAGES.findIndex((step) => step.key === stage);
 
@@ -284,6 +315,37 @@ function HandoffPanel({ threadId }: { threadId: string }) {
       <div className="flex h-full flex-col">
         <div className="flex-1 overflow-y-auto">
           <div className="flex flex-col gap-6 p-4">
+            {/* Partial-scope banner (opened from a message action) */}
+            {scope ? (
+              <div className="flex items-start gap-2.5 rounded-lg border border-primary/30 bg-primary/5 p-2.5">
+                <Icon name="Fork" className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden />
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className="text-sm font-medium leading-tight">
+                    Handing off up to a selected message
+                  </span>
+                  {scope.messagePreview ? (
+                    <span className="line-clamp-2 text-xs leading-snug text-muted-foreground">
+                      {scope.messageRole === "user" ? "You" : "Assistant"}: {scope.messagePreview}
+                    </span>
+                  ) : null}
+                  <span className="text-xs leading-snug text-muted-foreground">
+                    Everything after that message stays out of the handoff.
+                  </span>
+                </span>
+                <Tooltip>
+                  <TooltipTrigger
+                    type="button"
+                    onClick={() => setScopeCleared(true)}
+                    aria-label="Use the full thread instead"
+                    className="shrink-0 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  >
+                    <Icon name="X" className="size-3.5" aria-hidden />
+                  </TooltipTrigger>
+                  <TooltipContent>Use the full thread instead</TooltipContent>
+                </Tooltip>
+              </div>
+            ) : null}
+
             {/* Route header */}
             <div className="flex flex-col gap-2">
               <div className="flex items-center gap-2" aria-label="Handoff route">
@@ -622,9 +684,26 @@ export default definePluginApp((app) => {
   app.slots.threadPanelAction({
     id: "handoff",
     title: "Hand off",
-    icon: "Repeat",
+    icon: "ArrowTurnForward",
     layout: "flush",
     component: HandoffPanel,
+  });
+  app.slots.messageAction({
+    id: "handoff-from-here",
+    title: "Hand off from here",
+    icon: "ArrowTurnForward",
+    run: ({ message, openPanel }) => {
+      const opened = openPanel({
+        actionId: "handoff",
+        title: "Hand off",
+        params: {
+          upToSeq: message.sourceSeqEnd,
+          messagePreview: message.text.replace(/\s+/g, " ").trim().slice(0, 200),
+          messageRole: message.role,
+        },
+      });
+      if (!opened) toast.error("Couldn't open the Hand off panel here.");
+    },
   });
   app.slots.homepageSection({
     id: "adopt",

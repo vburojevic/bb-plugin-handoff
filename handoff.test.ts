@@ -161,4 +161,26 @@ describe("startHandoff", () => {
     expect(spawn.environment.workspace.type).toBe("managed-worktree");
     expect(spawn.model).toBeUndefined();
   });
+
+  it("with untilSeq, captures only up to the selected message", async () => {
+    const { bb, calls } = makeFakeBb();
+    await startHandoff(bb, {
+      sourceThreadId: "thr_src",
+      providerId: "codex",
+      workspace: "reuse",
+      untilSeq: 2,
+    });
+
+    const upload = calls.find((call) => call.method === "attachments.upload")!.args as {
+      clientFile: Uint8Array;
+    };
+    const doc = new TextDecoder().decode(upload.clientFile);
+    expect(doc).toContain("Build the feature");
+    expect(doc).toContain("partial capture");
+    expect(doc).not.toContain("Done with step one.");
+    expect(doc).not.toContain("Step one done.");
+
+    const spawn = calls.find((call) => call.method === "threads.spawn")!.args as { title: string };
+    expect(spawn.title).toBe("Handoff from message: Build feature X");
+  });
 });

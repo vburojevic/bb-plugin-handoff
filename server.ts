@@ -14,10 +14,13 @@ import { listHandoffs, renderHandoff, startHandoff, type WorkspaceMode } from ".
 
 const workspaceModeSchema = z.enum(["reuse", "worktree", "personal"]);
 
+/** Event-seq cutoff of one chat message; scopes the capture to everything up to it. */
+const upToSeqField = z.number().int().positive().optional();
+
 export const rpcContract = defineRpcContract({
   ...adoptRpcShape,
   prepareHandoff: {
-    input: z.object({ threadId: z.string() }).strict(),
+    input: z.object({ threadId: z.string(), upToSeq: upToSeqField }).strict(),
     output: z.object({
       title: z.string(),
       providerId: z.string(),
@@ -44,7 +47,7 @@ export const rpcContract = defineRpcContract({
     }),
   },
   previewHandoff: {
-    input: z.object({ threadId: z.string() }).strict(),
+    input: z.object({ threadId: z.string(), upToSeq: upToSeqField }).strict(),
     output: z.object({
       doc: z.string(),
       docBytes: z.number(),
@@ -65,6 +68,7 @@ export const rpcContract = defineRpcContract({
         model: z.string().optional(),
         workspace: workspaceModeSchema,
         extraInstructions: z.string().optional(),
+        upToSeq: upToSeqField,
       })
       .strict(),
     output: z.object({ newThreadId: z.string(), docBytes: z.number() }),
@@ -96,8 +100,8 @@ async function environmentIdOfThread(bb: BbPluginApi, threadId: string): Promise
 export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     ...createAdoptRpcHandlers(bb),
-    async prepareHandoff({ threadId }) {
-      const captured = await captureThread(bb, threadId);
+    async prepareHandoff({ threadId, upToSeq }) {
+      const captured = await captureThread(bb, threadId, { untilSeq: upToSeq });
       const doc = renderHandoff(captured, new Date());
       return {
         title: captured.title,
@@ -125,8 +129,8 @@ export default async function plugin(bb: BbPluginApi) {
         })),
       };
     },
-    async previewHandoff({ threadId }) {
-      const captured = await captureThread(bb, threadId);
+    async previewHandoff({ threadId, upToSeq }) {
+      const captured = await captureThread(bb, threadId, { untilSeq: upToSeq });
       const doc = renderHandoff(captured, new Date());
       const docBytes = new TextEncoder().encode(doc).byteLength;
       const PREVIEW_CAP = 250_000;
@@ -149,13 +153,14 @@ export default async function plugin(bb: BbPluginApi) {
         })),
       };
     },
-    async startHandoff({ threadId, providerId, model, workspace, extraInstructions }) {
+    async startHandoff({ threadId, providerId, model, workspace, extraInstructions, upToSeq }) {
       const result = await startHandoff(bb, {
         sourceThreadId: threadId,
         providerId,
         model,
         workspace,
         extraInstructions,
+        untilSeq: upToSeq,
       });
       bb.log.info(`handoff ${threadId} → ${providerId} (${result.newThreadId})`);
       return { newThreadId: result.newThreadId, docBytes: result.docBytes };
@@ -174,7 +179,7 @@ export default async function plugin(bb: BbPluginApi) {
         name: "start",
         summary: "Capture a thread and spawn a new thread on another provider seeded with it",
         usage:
-          "bb handoff <thread-id|--self> --to <provider> [--model <model>] [--workspace reuse|worktree|personal] [--instructions <text>] [--dry-run]",
+          "bb handoff <thread-id|--self> --to <provider> [--model <model>] [--workspace reuse|worktree|personal] [--instructions <text>] [--up-to-seq <n>] [--dry-run]",
       },
       {
         name: "export",
@@ -261,13 +266,19 @@ export default async function plugin(bb: BbPluginApi) {
         if (!workspaceModeSchema.safeParse(workspace).success) {
           return fail("--workspace must be reuse, worktree, or personal.");
         }
+        const upToSeqRaw = flags.get("--up-to-seq");
+        const upToSeq = upToSeqRaw ? Number.parseInt(upToSeqRaw, 10) : undefined;
+        if (upToSeqRaw && (!Number.isInteger(upToSeq) || upToSeq! <= 0)) {
+          return fail("--up-to-seq must be a positive integer (a message's sourceSeqEnd).");
+        }
         if (flags.has("--dry-run")) {
-          const captured = await captureThread(bb, threadId);
+          const captured = await captureThread(bb, threadId, { untilSeq: upToSeq });
           const doc = renderHandoff(captured, new Date());
           const stats = [
             `Source: ${captured.title} (${captured.providerId}, ${threadId})`,
             `Turns: ${captured.turns}, transcript entries: ${captured.entries.length}, events: ${captured.eventCount}`,
             `Handoff document: ${new TextEncoder().encode(doc).byteLength} bytes`,
+            `Scope: ${captured.untilSeq != null ? `partial — events up to seq ${captured.untilSeq}` : "full thread"}`,
             `Native session file: ${captured.nativeSessionPath ?? "(not found)"}`,
             `Workspace: ${captured.workspacePath ?? "(none)"}`,
           ];
@@ -280,6 +291,7 @@ export default async function plugin(bb: BbPluginApi) {
           model: flags.get("--model"),
           workspace,
           extraInstructions: flags.get("--instructions"),
+          untilSeq: upToSeq,
         });
         return {
           exitCode: 0,

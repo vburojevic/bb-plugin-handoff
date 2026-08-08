@@ -66,6 +66,10 @@ bb plugin install .
 - **Hand off**: in any thread, right panel (`⌘J`) → `+` new tab (`⌘T`) →
   **Hand off**. Pick a target agent, optionally a model, workspace mode, and a
   note; preview the exact document; start the handoff and land in the new thread.
+- **Hand off from here**: hover any message → **Hand off from here** in the
+  per-message action bar (or the text-selection menu). Opens the same panel
+  scoped to the conversation *up to that message* — later turns stay out of
+  the handoff document. Clear the banner to use the full thread instead.
 - **Adopt**: on the new-thread (compose) screen, expand **Continue a session
   from another agent**. Paste a session id or a whole resume command, or browse
   recent sessions by project/directory and tap one.
@@ -79,6 +83,7 @@ bb handoff <thread-id> --to acp-opencode \
   --model <model> --workspace worktree \
   --instructions "Finish the tests first"
 bb handoff <thread-id> --dry-run             # capture stats only
+bb handoff <thread-id> --to codex --up-to-seq <n>   # only context up to a message's sourceSeqEnd
 bb handoff export --self --out handoff.md    # for use outside bb:
 codex exec - < handoff.md                    #   e.g. pipe into codex
 bb handoff targets                           # list available providers

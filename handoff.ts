@@ -12,6 +12,8 @@ export interface HandoffRequest {
   model?: string;
   workspace: WorkspaceMode;
   extraInstructions?: string;
+  /** Capture only events up to this seq (anchored at a chat message). */
+  untilSeq?: number;
 }
 
 export interface HandoffRecord {
@@ -58,6 +60,9 @@ export function renderHandoff(captured: CapturedSession, capturedAt: Date): stri
     `- Source provider: ${captured.providerId}`,
     `- Workspace: ${captured.workspacePath ?? "(none)"}${captured.branchName ? ` (branch \`${captured.branchName}\`)` : ""}`,
     `- Captured: ${capturedAt.toISOString()} — ${captured.turns} turns, ${captured.entries.length} transcript entries`,
+    captured.untilSeq != null
+      ? `- Scope: partial capture — the conversation only up to a message the user selected (events up to seq ${captured.untilSeq}); anything the source thread did after that message is intentionally excluded`
+      : null,
     `- Native provider session file: ${captured.nativeSessionPath ? `\`${captured.nativeSessionPath}\`` : "(not found)"}`,
     "",
     "## How to continue",
@@ -153,7 +158,7 @@ export async function startHandoff(bb: BbPluginApi, request: HandoffRequest): Pr
     bb.realtime.publish(REALTIME_CHANNEL, { sourceThreadId: request.sourceThreadId, stage, ...extra });
 
   publish("capturing");
-  const captured = await captureThread(bb, request.sourceThreadId);
+  const captured = await captureThread(bb, request.sourceThreadId, { untilSeq: request.untilSeq });
   publish("rendering");
   const doc = renderHandoff(captured, new Date());
   const bytes = new TextEncoder().encode(doc);
@@ -172,7 +177,7 @@ export async function startHandoff(bb: BbPluginApi, request: HandoffRequest): Pr
     providerId: request.providerId,
     ...(request.model ? { model: request.model } : {}),
     environment: resolveEnvironment(request, captured),
-    title: `Handoff: ${captured.title}`,
+    title: `${captured.untilSeq != null ? "Handoff from message" : "Handoff"}: ${captured.title}`,
     input: [
       { type: "text", text: buildIntroPrompt(captured, request), mentions: [] },
       {

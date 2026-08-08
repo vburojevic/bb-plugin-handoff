@@ -14,7 +14,7 @@
     "name": "Handoff",
     "description": "Move a session between agents, in both directions — hand off a bb thread to another provider, or adopt an outside Claude Code / Codex / Gemini CLI session as a bb thread.",
     "branding": {
-      "icon": "Repeat"
+      "icon": "ArrowTurnForward"
     },
     "server": "./server.ts",
     "app": "./app.tsx",

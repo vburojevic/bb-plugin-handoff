@@ -19,6 +19,10 @@ Move a whole session between agents, in both directions.
 - `bb handoff --self --to <provider>` — hand off the current thread. Providers
   from `bb handoff targets` (e.g. `codex`, `claude-code`, `acp-opencode`).
 - `bb handoff <thread-id> --to <provider> [--model <model>] [--workspace reuse|worktree|personal] [--instructions <text>]`
+- `bb handoff <thread-id|--self> --to <provider> --up-to-seq <n>` — hand off
+  only the context up to one chat message (its `sourceSeqEnd`); everything
+  after that message is excluded from the handoff document. This is what the
+  "Hand off from here" per-message action uses.
 - `bb handoff <thread-id|--self> --dry-run` — capture stats only, no thread.
 - `bb handoff export <thread-id|--self> [--out <path>]` — write the handoff
   markdown to a file for use outside bb: `codex exec - < handoff.md` or

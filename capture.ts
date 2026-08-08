@@ -299,11 +299,25 @@ export interface CapturedSession {
   eventCount: number;
   latestOutput: string | null;
   nativeSessionPath: string | null;
+  /** Event-seq cutoff of a partial capture (anchored at a chat message); null = full thread. */
+  untilSeq: number | null;
+}
+
+export interface CaptureOptions {
+  /**
+   * Only include events with `seq <= untilSeq` — a partial capture anchored at
+   * one chat message (`ThreadChatMessageReference.sourceSeqEnd`).
+   */
+  untilSeq?: number;
 }
 
 const EVENT_PAGE_SIZE = 1000;
 
-export async function captureThread(bb: BbPluginApi, threadId: string): Promise<CapturedSession> {
+export async function captureThread(
+  bb: BbPluginApi,
+  threadId: string,
+  options?: CaptureOptions,
+): Promise<CapturedSession> {
   // deno-lint-ignore no-explicit-any
   const thread = (await bb.sdk.threads.get({ threadId })) as any;
   const environmentId: string | null = thread.environmentId ?? null;
@@ -323,24 +337,34 @@ export async function captureThread(bb: BbPluginApi, threadId: string): Promise<
 
   const rows: EventRowLike[] = [];
   let afterSeq: string | undefined;
+  const untilSeq = options?.untilSeq ?? null;
   for (;;) {
     const page = (await bb.sdk.threads.events.list({
       threadId,
       afterSeq,
       limit: String(EVENT_PAGE_SIZE),
     })) as unknown as EventRowLike[];
-    rows.push(...page);
+    const scoped = untilSeq != null ? page.filter((row) => row.seq <= untilSeq) : page;
+    rows.push(...scoped);
     if (page.length < EVENT_PAGE_SIZE) break;
+    // A page that reached past the cutoff means nothing relevant comes after.
+    if (untilSeq != null && scoped.length < page.length) break;
     afterSeq = String(page[page.length - 1]!.seq);
   }
 
   const { entries, providerThreadId, turns } = projectEvents(rows);
 
   let latestOutput: string | null = null;
-  try {
-    latestOutput = (await bb.sdk.threads.output({ threadId })).output;
-  } catch {
-    // No output yet — fine.
+  if (untilSeq != null) {
+    // The thread-level output belongs to the full session; for a partial
+    // capture the latest in-scope assistant message is the honest "latest".
+    latestOutput = [...entries].reverse().find((entry) => entry.kind === "assistant")?.body ?? null;
+  } else {
+    try {
+      latestOutput = (await bb.sdk.threads.output({ threadId })).output;
+    } catch {
+      // No output yet — fine.
+    }
   }
 
   const providerId: string = thread.providerId ?? "unknown";
@@ -366,5 +390,6 @@ export async function captureThread(bb: BbPluginApi, threadId: string): Promise<
     eventCount: rows.length,
     latestOutput,
     nativeSessionPath,
+    untilSeq,
   };
 }
