@@ -3,10 +3,12 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import {
   collectSessions,
+  listRemoteSessionsForDirectory,
   parseAdoptQuery,
   performAdopt,
   performAdoptQuery,
   performAdoptRemote,
+  type RemoteListResult,
 } from "./adopt-core";
 
 interface Flags {
@@ -65,12 +67,18 @@ Usage:
       "claude --resume <id>" — located across every agent's session store.
 
   bb handoff adopt <session-id> --machine <host name or id> [--home <path>] [--cwd <path>]
-      Adopt a Claude Code or Codex session that lives on another enrolled
-      machine; the thread runs on that machine in the session's directory.
+  bb handoff adopt --machine <host> --cwd <path>
+      Adopt a session that lives on another enrolled machine; the thread runs
+      on that machine in the session's directory. With --cwd and no id, the
+      newest session for that directory over there is adopted. All four agents
+      are supported: Claude Code and Codex are found by id alone, Gemini and
+      OpenCode need --cwd (or an exact id) since their ids are not in a path.
       --home overrides the remote home directory when it can't be derived.
 
   bb handoff adopt list [--cwd <path>] [--agent <name>] [--limit <n>] [--json]
+  bb handoff adopt list --machine <host> --cwd <path>
       List adoptable sessions for a directory (newest first, all agents).
+      With --machine, lists what is adoptable in that directory over there.
 
   bb handoff adopt session [<session-id>] [options]
       Create a bb thread that continues a session. Defaults to the newest
@@ -89,9 +97,9 @@ Usage:
         --json                   Machine-readable output
 
 Notes:
-  Sessions are read from the machine running the bb server. Run it from inside
-  a live session's directory (or have the agent run it) — the newest session
-  for that directory is the one you're in.`;
+  Without --machine, sessions are read from the machine running the bb server.
+  Run it from inside a live session's directory (or have the agent run it) —
+  the newest session for that directory is the one you're in.`;
 
 // One entry: bb rejects command names containing a space, so the `list` /
 // `session` subcommands live in the usage line (and in full in the skill).
@@ -99,9 +107,9 @@ export const adoptCommandSpecs = [
   {
     name: "adopt",
     summary:
-      "Adopt a session that ran outside bb (Claude Code, Codex, Gemini CLI, OpenCode) as a bb thread; `adopt list` shows what is adoptable",
+      "Adopt a session that ran outside bb (Claude Code, Codex, Gemini CLI, OpenCode) — on this machine or any enrolled one — as a bb thread; `adopt list` shows what is adoptable",
     usage:
-      "bb handoff adopt [<session-id | resume command>] [--cwd <path>] [--agent claude|codex|gemini|opencode] [--machine <host>] [--home <path>] [--force] [--dry-run] [--json]  |  bb handoff adopt list [--cwd <path>] [--limit <n>]",
+      "bb handoff adopt [<session-id | resume command>] [--cwd <path>] [--agent claude|codex|gemini|opencode] [--machine <host>] [--home <path>] [--force] [--dry-run] [--json]  |  bb handoff adopt list [--machine <host>] [--cwd <path>] [--limit <n>]",
   },
 ];
 
@@ -125,9 +133,14 @@ export async function runAdoptCli(
   let command = first;
   let rest = restArgs;
   if (command !== "list" && command !== "session") {
-    // `bb handoff adopt <id | resume command>` shorthand for `… adopt session`.
-    const probe = parseAdoptQuery(argv.filter((arg) => !arg.startsWith("--")).join(" "));
-    if (!probe.sessionId && !probe.newest) {
+    // `bb handoff adopt <id | resume command>` shorthand for `… adopt session`,
+    // and the id-less forms that say where to look instead (--machine/--cwd).
+    // Probing goes through the flag parser so a flag's VALUE is never mistaken
+    // for a pasted session id.
+    const probe = parseArgs(argv);
+    const parsedQuery = parseAdoptQuery(probe.positional.join(" ").trim());
+    const routed = probe.values.has("machine") || probe.values.has("cwd");
+    if (!parsedQuery.sessionId && !parsedQuery.newest && !routed) {
       return { exitCode: 1, stderr: `Unknown adopt command "${first}".\n\n${ADOPT_HELP}` };
     }
     command = "session";
@@ -141,13 +154,51 @@ export async function runAdoptCli(
   }
 
   if (command === "list") {
+    const limit = Number(flags.values.get("limit") ?? "10");
+    const take = Number.isFinite(limit) ? limit : 10;
     if (machine) {
-      return { exitCode: 1, stderr: "`adopt list` is local-only; use --machine with a session id." };
+      // A remote listing is always directory-scoped: the invoking cwd is a
+      // path on THIS machine, so it is never assumed to exist over there.
+      const remoteCwd = flags.values.get("cwd");
+      if (!remoteCwd) {
+        return {
+          exitCode: 1,
+          stderr: `Listing sessions on another machine needs the directory there: bb handoff adopt list --machine ${machine} --cwd <path>`,
+        };
+      }
+      const result = await listRemoteSessionsForDirectory(bb, {
+        machine,
+        cwd: remoteCwd,
+        home: flags.values.get("home") ?? null,
+        agent: flags.values.get("agent"),
+      });
+      if ("error" in result && !("sessions" in result)) {
+        return { exitCode: 1, stderr: result.error };
+      }
+      const listing = result as RemoteListResult;
+      const sessions = listing.sessions.slice(0, take);
+      if (flags.booleans.has("json")) {
+        return { exitCode: 0, stdout: JSON.stringify({ ...listing, sessions }, null, 2) };
+      }
+      if (sessions.length === 0) {
+        return {
+          exitCode: 0,
+          stdout: `No agent sessions found for ${listing.cwd} on ${listing.machine}${listing.error ? `\n${listing.error}` : ""}`,
+        };
+      }
+      const lines = sessions.map((session) => {
+        const age = session.modifiedAtMs ? formatAge(Date.now() - session.modifiedAtMs) : "unknown";
+        const size = session.sizeBytes ? `${Math.max(1, Math.round(session.sizeBytes / 1024))}KB` : "-";
+        return `${session.agent.padEnd(7)} ${session.sessionId}  ${age.padEnd(9)} ${size.padEnd(8)} ${session.title ?? ""}`.trimEnd();
+      });
+      return {
+        exitCode: 0,
+        stdout: `Sessions for ${listing.cwd} on ${listing.machine} (newest first):\n${lines.join("\n")}${listing.error ? `\n\n${listing.error}` : ""}\n\nAdopt one with: bb handoff adopt <session-id> --machine ${machine} --cwd ${listing.cwd}`,
+      };
     }
     const collected = collectSessions(cwd!, flags.values.get("agent"));
     if ("error" in collected) return { exitCode: 1, stderr: collected.error };
-    const limit = Number(flags.values.get("limit") ?? "10");
-    const sessions = collected.slice(0, Number.isFinite(limit) ? limit : 10);
+    const sessions = collected.slice(0, take);
     if (flags.booleans.has("json")) {
       return { exitCode: 0, stdout: JSON.stringify({ cwd, sessions }, null, 2) };
     }
@@ -178,15 +229,21 @@ export async function runAdoptCli(
   // resume command — route it through the query engine (global lookup).
   const positionalQuery = flags.positional.join(" ").trim();
   const agentFlag = flags.values.get("agent");
-  if (machine && !positionalQuery) {
-    return { exitCode: 1, stderr: "Remote adoption needs a session id: bb handoff adopt <id> --machine <host>." };
+  if (machine && !positionalQuery && !flags.values.get("cwd")) {
+    return {
+      exitCode: 1,
+      stderr: `Adopting from another machine needs a session id, or --cwd <path> for its newest session: bb handoff adopt <id> --machine ${machine}`,
+    };
   }
   const outcome = machine
     ? await performAdoptRemote(bb, {
         machine,
-        query: agentFlag ? `${agentFlag} ${positionalQuery}` : positionalQuery,
+        ...(positionalQuery
+          ? { query: agentFlag ? `${agentFlag} ${positionalQuery}` : positionalQuery }
+          : {}),
         cwd: flags.values.get("cwd") ?? null,
         home: flags.values.get("home") ?? null,
+        agent: agentFlag,
         ...shared,
       })
     : positionalQuery

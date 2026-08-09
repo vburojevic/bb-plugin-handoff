@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-handoff",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "type": "module",
   "scripts": {
     "test": "vitest run",
@@ -12,7 +12,7 @@
   },
   "bb": {
     "name": "Handoff",
-    "description": "Move a session between agents, in both directions — hand off a bb thread to another provider, or adopt an outside Claude Code / Codex / Gemini CLI session as a bb thread.",
+    "description": "Move a session between agents and machines, in both directions — hand off a bb thread to another provider (and optionally another enrolled machine, carrying uncommitted work), or adopt an outside Claude Code / Codex / Gemini CLI / OpenCode session, local or remote, as a bb thread.",
     "branding": {
       "icon": "./assets/icon.svg"
     },

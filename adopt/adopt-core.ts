@@ -3,9 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { deriveHomeDir } from "../capture";
+import { listMachines, matchMachine } from "../machines";
 import { ADAPTERS, getAdapter, resolveAgentId } from "./agents";
-import { parseClaudeContent } from "./agents/claude";
-import { parseCodexContent } from "./agents/codex";
+import {
+  findRemoteSession,
+  listRemoteSessions,
+  readRemoteSession,
+  type RemoteContext,
+} from "./remote";
 import type { AgentAdapter, AgentId, FoundSession, ParsedSession } from "./transcript";
 import type { SessionSummary } from "./transcript";
 
@@ -509,71 +514,64 @@ export async function performAdoptQuery(
 }
 
 // ---------------------------------------------------------------------------
-// Remote adoption: sessions on another enrolled machine, via bb.sdk.files.
-// Claude Code and Codex only — their session stores are flat-file and their
-// ids appear in filenames, so bb's remote fuzzy file listing can find them.
-// (Gemini ids live inside the files; OpenCode sessions live in SQLite —
-// neither is discoverable through the remote file API.)
+// Remote adoption: sessions that live on another enrolled machine. The stores
+// are read over bb's host file API and, where a store is not addressable by
+// path alone, a short-lived host terminal — see adopt/remote.ts.
 
 export interface RemoteAdoptOptions extends AdoptFileOptions {
   /** Host id or name of the enrolled machine holding the session. */
   machine: string;
-  /** Session id, id prefix, or pasted resume command. */
-  query: string;
-  /** Override when the session's own cwd can't be recovered. */
+  /** Session id, id prefix, or pasted resume command. Omit for the newest. */
+  query?: string;
+  /** The session's working directory on that machine. */
   cwd?: string | null;
   /** Override when no project source exists on that host to derive it from. */
   home?: string | null;
+  /** Restrict to one agent's store. */
+  agent?: string;
 }
 
-function pathsOfListing(listing: unknown): string[] {
-  // deno-lint-ignore no-explicit-any
-  const entries: any[] = Array.isArray(listing)
-    ? listing
-    : // deno-lint-ignore no-explicit-any
-      ((listing as any)?.files ?? (listing as any)?.entries ?? []);
-  const out: string[] = [];
-  for (const entry of entries) {
-    const p = typeof entry === "string" ? entry : (entry?.path ?? entry?.relativePath);
-    if (typeof p === "string") out.push(p);
-  }
-  return out;
-}
+/** Resolve the machine, its home directory, and whether it is actually local. */
+type FailedOutcome = Extract<AdoptOutcome, { ok: false }>;
 
-export async function performAdoptRemote(
+async function resolveRemoteContext(
   bb: BbPluginApi,
-  options: RemoteAdoptOptions,
-): Promise<AdoptOutcome> {
-  // Resolve the machine among enrolled hosts by id or name.
-  const listed = (await bb.sdk.hosts.list().catch(() => null)) as unknown;
-  // deno-lint-ignore no-explicit-any
-  const hosts: any[] = Array.isArray(listed) ? listed : ((listed as any)?.hosts ?? []);
-  const needle = options.machine.toLowerCase();
-  const host = hosts.find(
-    (h) => h?.id === options.machine || String(h?.name ?? "").toLowerCase() === needle,
-  );
+  machine: string,
+  homeOverride?: string | null,
+): Promise<
+  | { ok: false; outcome: FailedOutcome }
+  | { ok: true; local: true }
+  | { ok: true; local: false; ctx: RemoteContext }
+> {
+  const machines = await listMachines(bb).catch(() => []);
+  const host = matchMachine(machines, machine);
   if (!host) {
-    const known = hosts.map((h) => h?.name ?? h?.id).filter(Boolean).join(", ") || "(none)";
-    return { ok: false, code: "bad-host", message: `Unknown machine "${options.machine}". Enrolled hosts: ${known}` };
-  }
-  const { primaryHostId } = await bb.sdk.system.config();
-  if (host.id === primaryHostId) {
-    // Local after all — the full multi-agent engine applies.
-    return performAdoptQuery(bb, { ...options, cwd: options.cwd ?? null, query: options.query });
-  }
-
-  const parsed = parseAdoptQuery(options.query);
-  if (!parsed.sessionId) {
+    const known = machines.map((m) => m.name).join(", ") || "(none)";
     return {
       ok: false,
-      code: "no-id",
-      message: "Remote adoption needs an explicit session id — paste the id or a resume command.",
+      outcome: {
+        ok: false,
+        code: "bad-host",
+        message: `Unknown machine "${machine}". Enrolled machines: ${known}`,
+      },
+    };
+  }
+  const { primaryHostId } = await bb.sdk.system.config().catch(() => ({ primaryHostId: null }));
+  if (host.id === primaryHostId) return { ok: true, local: true };
+  if (!host.connected) {
+    return {
+      ok: false,
+      outcome: {
+        ok: false,
+        code: "disconnected",
+        message: `${host.name} is disconnected — bring it online to read its sessions.`,
+      },
     };
   }
 
-  // Home directory on the remote host: explicit override, else derived from a
+  // Home directory on that machine: explicit override, else derived from a
   // project source that lives there.
-  let home = options.home?.trim() || null;
+  let home = homeOverride?.trim() || null;
   if (!home) {
     const projects = await bb.sdk.projects.list({ includePersonal: true }).catch(() => []);
     for (const project of projects) {
@@ -588,84 +586,190 @@ export async function performAdoptRemote(
   if (!home) {
     return {
       ok: false,
-      code: "no-home",
-      message: `Couldn't derive the home directory on ${host.name ?? host.id} — pass --home <path>.`,
+      outcome: {
+        ok: false,
+        code: "no-home",
+        message: `Couldn't derive the home directory on ${host.name} — pass --home <path>.`,
+      },
+    };
+  }
+  return { ok: true, local: false, ctx: { bb, hostId: host.id, hostName: host.name, home } };
+}
+
+export interface RemoteListResult {
+  cwd: string;
+  machine: string;
+  sessions: FoundSession[];
+  error?: string;
+}
+
+/** `bb handoff adopt list --machine <host> --cwd <path>`. */
+export async function listRemoteSessionsForDirectory(
+  bb: BbPluginApi,
+  options: { machine: string; cwd: string; home?: string | null; agent?: string },
+): Promise<RemoteListResult | { error: string }> {
+  const resolved = await resolveRemoteContext(bb, options.machine, options.home);
+  if (!resolved.ok) return { error: resolved.outcome.message ?? "Unknown machine." };
+  if (resolved.local) {
+    const collected = collectSessions(options.cwd, options.agent);
+    if ("error" in collected) return { error: collected.error };
+    return {
+      cwd: options.cwd,
+      machine: options.machine,
+      sessions: collected.map((session) => ({ ...session, cwd: options.cwd })),
+    };
+  }
+  let agentFilter: AgentId | null = null;
+  if (options.agent) {
+    agentFilter = resolveAgentId(options.agent);
+    if (!agentFilter) {
+      return { error: `Unknown agent "${options.agent}". Supported: claude, codex, gemini, opencode.` };
+    }
+  }
+  const { sessions, execFailed } = await listRemoteSessions(resolved.ctx, options.cwd, agentFilter);
+  return {
+    cwd: options.cwd,
+    machine: resolved.ctx.hostName,
+    sessions,
+    ...(execFailed
+      ? {
+          error: `Could not run the session scan on ${resolved.ctx.hostName}. Adoption by session id still works.`,
+        }
+      : {}),
+  };
+}
+
+export async function performAdoptRemote(
+  bb: BbPluginApi,
+  options: RemoteAdoptOptions,
+): Promise<AdoptOutcome> {
+  const resolved = await resolveRemoteContext(bb, options.machine, options.home);
+  if (!resolved.ok) return resolved.outcome;
+  if (resolved.local) {
+    // Local after all — the full local engine applies.
+    return options.query?.trim()
+      ? performAdoptQuery(bb, { ...options, cwd: options.cwd ?? null, query: options.query })
+      : options.cwd
+        ? performAdopt(bb, { ...options, cwd: options.cwd, agent: options.agent })
+        : {
+            ok: false,
+            code: "no-cwd",
+            message: "That machine is the bb server itself — pass a session id or --cwd.",
+          };
+  }
+  const ctx = resolved.ctx;
+
+  const parsed = options.query?.trim() ? parseAdoptQuery(options.query) : null;
+  const agentHint = parsed?.agentHint ?? (options.agent ? resolveAgentId(options.agent) : null);
+  let matches: FoundSession[] = [];
+
+  if (parsed?.sessionId) {
+    matches = await findRemoteSession(ctx, parsed.sessionId, agentHint);
+    if (matches.length === 0 && options.cwd) {
+      // Not found by id alone (Gemini prefixes, Codex date shards) — fall back
+      // to the directory scan and match the id there.
+      const listed = await listRemoteSessions(ctx, options.cwd, agentHint);
+      const needle = parsed.sessionId.toLowerCase();
+      matches = listed.sessions.filter(
+        (session) =>
+          session.sessionId.toLowerCase() === needle ||
+          session.sessionId.toLowerCase().startsWith(needle) ||
+          session.filePath.toLowerCase().includes(needle),
+      );
+    }
+    if (matches.length === 0) {
+      return {
+        ok: false,
+        code: "not-found",
+        message: `No session matching "${parsed.sessionId}" found on ${ctx.hostName}${options.cwd ? ` (searched all stores, and ${options.cwd})` : " — add --cwd <path> to scan a directory as well"}.`,
+      };
+    }
+  } else {
+    // No id: adopt the newest session for a directory on that machine.
+    if (!options.cwd) {
+      return {
+        ok: false,
+        code: "no-id",
+        message: `Pass a session id, or --cwd <path> to adopt the newest session for a directory on ${ctx.hostName}.`,
+      };
+    }
+    const listed = await listRemoteSessions(ctx, options.cwd, agentHint);
+    if (listed.execFailed) {
+      return {
+        ok: false,
+        code: "exec-failed",
+        message: `Could not scan ${options.cwd} on ${ctx.hostName}. Pass an explicit session id instead.`,
+      };
+    }
+    if (listed.sessions.length === 0) {
+      return {
+        ok: false,
+        code: "no-sessions",
+        message: `No agent sessions found for ${options.cwd} on ${ctx.hostName}.`,
+      };
+    }
+    matches = [listed.sessions[0]!];
+  }
+
+  if (matches.length > 1) {
+    const exact = parsed?.sessionId
+      ? matches.filter((m) => m.sessionId.toLowerCase() === parsed.sessionId!.toLowerCase())
+      : [];
+    if (exact.length === 1) matches = exact;
+  }
+  if (matches.length > 1) {
+    return {
+      ok: false,
+      code: "ambiguous",
+      message: `${matches.length} sessions on ${ctx.hostName} match — pick one by full id.`,
+      matches,
     };
   }
 
-  // Search the flat-file stores for the id.
-  const stores: { agent: AgentId; root: string; parse: typeof parseClaudeContent }[] = [
-    { agent: "claude", root: `${home}/.claude/projects`, parse: parseClaudeContent },
-    { agent: "codex", root: `${home}/.codex/sessions`, parse: parseCodexContent },
-  ];
-  const candidates = parsed.agentHint
-    ? stores.filter((store) => store.agent === parsed.agentHint)
-    : stores;
-  for (const store of candidates) {
-    let hit: string | null = null;
-    try {
-      const listing = await bb.sdk.files.list({
-        hostId: host.id,
-        path: store.root,
-        query: parsed.sessionId,
-        limit: 5,
-      });
-      hit =
-        pathsOfListing(listing).find(
-          (p) => p.endsWith(".jsonl") && p.includes(parsed.sessionId!),
-        ) ?? null;
-    } catch {
-      continue; // store missing on that host
-    }
-    if (!hit) continue;
-
-    const fullPath = `${store.root}/${hit}`;
-    const file = await bb.sdk.files.read({ hostId: host.id, path: fullPath });
-    const content =
-      file.contentEncoding === "base64"
-        ? Buffer.from(file.content, "base64").toString("utf8")
-        : file.content;
-    const maxChars = options.maxChars ?? 150_000;
-    const session = store.parse(content, fullPath, {
+  const match = matches[0]!;
+  const maxChars = options.maxChars ?? 150_000;
+  let session: ParsedSession;
+  try {
+    session = await readRemoteSession(ctx, match, {
       maxChars: Number.isFinite(maxChars) && maxChars > 1000 ? maxChars : 150_000,
     });
-    if (!session.transcript.trim()) {
-      return {
-        ok: false,
-        code: "empty-session",
-        message: `Session ${session.sessionId} has no conversation content to adopt.`,
-      };
-    }
-    const cwd = session.cwd ?? options.cwd ?? null;
-    if (!cwd) {
-      return {
-        ok: false,
-        code: "no-cwd",
-        message: `Found the ${session.agentLabel} session on ${host.name ?? host.id}, but its directory can't be determined — pass --cwd <path>.`,
-      };
-    }
-
-    const kvKey = `adopted:${session.agent}:${session.sessionId}`;
-    if (inFlightAdoptions.has(kvKey)) {
-      return { ok: false, code: "in-progress", message: `Session ${session.sessionId} is already being adopted.` };
-    }
-    inFlightAdoptions.add(kvKey);
-    try {
-      const lastMs = session.lastTimestamp ? Date.parse(session.lastTimestamp) : Number.NaN;
-      return await adoptParsedSession(bb, getAdapter(session.agent), session, kvKey, cwd, options, {
-        hostId: host.id,
-        possiblyLive: isPossiblyLive(Number.isFinite(lastMs) ? lastMs : null),
-      });
-    } finally {
-      inFlightAdoptions.delete(kvKey);
-    }
+  } catch (error) {
+    return {
+      ok: false,
+      code: "read-failed",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (!session.transcript.trim()) {
+    return {
+      ok: false,
+      code: "empty-session",
+      message: `Session ${session.sessionId} has no conversation content to adopt.`,
+    };
+  }
+  const cwd = session.cwd ?? match.cwd ?? options.cwd ?? null;
+  if (!cwd) {
+    return {
+      ok: false,
+      code: "no-cwd",
+      message: `Found the ${session.agentLabel} session on ${ctx.hostName}, but its directory can't be determined — pass --cwd <path>.`,
+    };
   }
 
-  return {
-    ok: false,
-    code: "not-found",
-    message: `No Claude Code or Codex session matching "${parsed.sessionId}" found on ${host.name ?? host.id}. (Gemini and OpenCode sessions can only be adopted on the bb server machine.)`,
-  };
+  const kvKey = `adopted:${session.agent}:${session.sessionId}`;
+  if (inFlightAdoptions.has(kvKey)) {
+    return { ok: false, code: "in-progress", message: `Session ${session.sessionId} is already being adopted.` };
+  }
+  inFlightAdoptions.add(kvKey);
+  try {
+    const lastMs = session.lastTimestamp ? Date.parse(session.lastTimestamp) : Number.NaN;
+    return await adoptParsedSession(bb, getAdapter(session.agent), session, kvKey, cwd, options, {
+      hostId: ctx.hostId,
+      possiblyLive: isPossiblyLive(Number.isFinite(lastMs) ? lastMs : null),
+    });
+  } finally {
+    inFlightAdoptions.delete(kvKey);
+  }
 }
 
 /** Resolve the directory to look in for a project: its default source path. */

@@ -1,14 +1,19 @@
 # bb-plugin-handoff
 
-Move a whole session between agents, **in both directions**:
+Move a whole session between agents **and between machines**, in both
+directions:
 
 - **Hand off** — capture the full transcript of a bb thread and continue it on
-  Codex, Claude Code, opencode, Kimi, or any installed provider in a new thread.
+  Codex, Claude Code, opencode, Kimi, or any installed provider — in a new
+  thread on this machine or on any other enrolled one.
 - **Adopt** — take a session that ran *outside* bb in a terminal (Claude Code,
-  Codex, Gemini CLI) and continue it as a bb thread in the same directory.
+  Codex, Gemini CLI, OpenCode), on this machine or another enrolled one, and
+  continue it as a bb thread in the same directory.
 
 Same problem, two directions: no provider can natively load another provider's
 session format, so a rendered transcript is the portable path between them.
+Machines are the second axis — a bb thread is pinned to one, so moving a
+session across them means moving the working state too, not just the words.
 
 ## Handing off (bb thread → any provider)
 
@@ -30,6 +35,33 @@ session format, so a rendered transcript is the portable path between them.
 Verified live: a Claude Code session handed off to Kimi continued with full
 context awareness.
 
+### To another machine
+
+`--machine <host>` (UI: the **Machine** picker) runs the new thread on a
+different enrolled machine. Provider discovery, models, and workspace options
+all re-scope to that machine — it may not have the same CLIs installed.
+
+Because a workspace cannot span machines, the modes differ:
+
+| Workspace   | Same machine                       | Another machine                                    |
+| ----------- | ---------------------------------- | -------------------------------------------------- |
+| `reuse`     | the thread's own environment       | not possible — the environment lives on one host    |
+| `checkout`  | the project's checkout             | that machine's checkout of the same project        |
+| `worktree`  | isolated worktree, default branch  | isolated worktree, based on the thread's branch when that machine has it |
+| `personal`  | blank workspace                    | blank workspace over there                          |
+
+A machine hop is the one case where the transcript alone would mislead: the
+files it discusses are on a disk the new agent cannot see. So the handoff also:
+
+- captures the source workspace's git state (branch, HEAD, dirty files),
+- writes a patch of everything uncommitted to `/tmp/bb-handoff-<thread>.patch`
+  **on the target machine**, with `git apply --3way` instructions in the
+  document — the source machine keeps the originals,
+- rewrites the document's wording: the source path and the native session file
+  are named as being on the *other* machine rather than offered as readable,
+- warns when the thread's branch does not exist on the target machine, and
+  falls back to the default branch instead of failing.
+
 ## Adopting (external session → bb thread)
 
 | Agent       | Session store                                  | Continues on                          |
@@ -41,8 +73,13 @@ context awareness.
 
 - Finds session files for a working directory across all supported agents and
   picks the newest (or the one you name), or locates a pasted id globally.
-- `--machine <host>` adopts a Claude Code or Codex session from another
-  enrolled machine (read via bb's file API; the thread runs on that host).
+- `--machine <host>` adopts a session from another enrolled machine — all four
+  agents — and runs the thread on that machine. Claude Code and Codex are found
+  by session id alone (bb's file API sees the id in the path); Gemini and
+  OpenCode need `--cwd <path>` or an exact id, since their ids live inside a
+  file and a SQLite row. `adopt list --machine <host> --cwd <path>` shows what
+  is adoptable over there, and `--machine` with `--cwd` and no id takes the
+  newest.
 - A session with activity in the last ~10 minutes gets a "may still be
   running" warning in the handoff document so the agent watches for
   concurrent edits.
@@ -94,7 +131,10 @@ bb handoff <thread-id> --dry-run             # capture stats only
 bb handoff <thread-id> --to codex --up-to-seq <n>   # only context up to a message's sourceSeqEnd
 bb handoff export --self --out handoff.md    # for use outside bb:
 codex exec - < handoff.md                    #   e.g. pipe into codex
-bb handoff targets [--json]                  # list available providers
+bb handoff <thread-id> --to codex --machine mini   # continue on another machine
+                                             # (defaults to that machine's checkout;
+                                             #  uncommitted work travels as a patch)
+bb handoff targets [--machine <host>] [--json]  # providers, per machine, + machine list
 bb handoff list [--json]                     # past handoffs (kept to the last 100)
 bb handoff help                              # usage overview
 
@@ -105,6 +145,11 @@ bb handoff adopt "claude --resume 9ace2fd5-d8ae-4946-a0a0-9ff58a6795df"
 bb handoff adopt "codex resume 019fd95c-907f-7eb1-8dfc-2aad427ffc09"
 bb handoff adopt list --cwd <path>           # what's adoptable here
 bb handoff adopt session --dry-run           # plan only
+
+# Adopt from another machine
+bb handoff adopt list --machine mini --cwd /Users/mini/Git/app
+bb handoff adopt <session-id> --machine mini
+bb handoff adopt --machine mini --cwd /Users/mini/Git/app   # newest over there
 ```
 
 Agents get both capabilities through the bundled `handoff` skill — asking an
@@ -114,10 +159,14 @@ agent to "continue this in Codex" or "adopt my terminal session" triggers it.
 
 ```
 capture.ts  handoff.ts   handing off: event-log capture → document → spawn
+machines.ts              the machine axis: target host + workspace planning,
+                         working-tree capture, patch delivery
 adopt/                   adopting: external session stores → bb thread
   agents/                one adapter per agent (list / find / parse)
   transcript.ts          shared block model + budgeted markdown rendering
   adopt-core.ts          query parsing, global lookup, adoption engine
+  remote.ts              the same stores read over bb's host file API + a
+                         short-lived host terminal
   cli.ts  rpc.ts  section.tsx
 ```
 
@@ -127,8 +176,17 @@ Adding an agent: implement `AgentAdapter` from `adopt/transcript.ts` in
 
 ## Limitations
 
-- Adoption reads sessions from the machine running the bb server (threads
-  spawn on the primary host).
+- Remote reads need the machine connected. Discovery there runs one short-lived
+  terminal (POSIX `sh`, `stat`, `find`, and `sqlite3` for OpenCode); when that
+  cannot run, adoption by explicit session id still works for Claude and Codex
+  through the file API alone.
+- A remote listing is always directory-scoped: `--cwd` is required, because the
+  invoking directory is a path on *this* machine.
+- Remote listings show no titles — reading each file for one would cost a
+  round trip per session.
+- Cross-machine handoff carries uncommitted changes as a patch (capped at 2 MB),
+  not the workspace itself. Untracked build output, ignored files, and anything
+  outside the repo stay behind.
 - Continuation is transcript-based: the new thread is a fresh provider session
   seeded with the prior conversation, not a native resume of the original
   session file. Work done in the old session *after* adopting is not carried
@@ -142,7 +200,8 @@ Adding an agent: implement `AgentAdapter` from `adopt/transcript.ts` in
 
 ```sh
 npm install
-npm test              # 42 unit tests (capture/render, adopt engine + adapters)
+npm test              # 105 unit tests (capture/render, transfer planning,
+                      # adopt engine + adapters, remote store readers)
 npm run typecheck
 bb plugin install .   # register with your bb
 bb plugin dev         # watch loop: rebuild + reload on save

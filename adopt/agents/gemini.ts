@@ -155,43 +155,73 @@ export const geminiAdapter: AgentAdapter = {
   },
 
   parse(filePath: string, options: { maxChars?: number } = {}): ParsedSession {
-    const maxChars = options.maxChars ?? 150_000;
     const data = readSessionFile(filePath);
     if (!data) throw new Error(`Not a Gemini CLI session file: ${filePath}`);
-    const builder = new BlockBuilder();
-    const messages = Array.isArray(data.messages) ? (data.messages as GeminiMessage[]) : [];
-    for (const message of messages) {
-      const content = typeof message.content === "string" ? message.content : "";
-      if (message.type === "user") {
-        builder.addText("user", content);
-      } else if (message.type === "gemini") {
-        builder.addText("assistant", content);
-        if (Array.isArray(message.toolCalls)) {
-          for (const call of message.toolCalls) {
-            if (typeof call !== "object" || call === null) continue;
-            const tool = call as Record<string, unknown>;
-            if (typeof tool.name === "string") builder.addTool(formatToolCall(tool.name, tool.args));
-          }
+    return parseGeminiData(data, filePath, options);
+  },
+};
+
+/** Parse an already-loaded session file — shared with remote adoption. */
+export function parseGeminiContent(
+  content: string,
+  filePath: string,
+  options: { maxChars?: number } = {},
+): ParsedSession {
+  let data: GeminiSessionFile;
+  try {
+    const value = JSON.parse(content);
+    if (typeof value !== "object" || value === null) throw new Error("not an object");
+    data = value as GeminiSessionFile;
+  } catch {
+    throw new Error(`Not a Gemini CLI session file: ${filePath}`);
+  }
+  return parseGeminiData(data, filePath, options);
+}
+
+function parseGeminiData(
+  data: GeminiSessionFile,
+  filePath: string,
+  options: { maxChars?: number } = {},
+): ParsedSession {
+  const maxChars = options.maxChars ?? 150_000;
+  const builder = new BlockBuilder();
+  const messages = Array.isArray(data.messages) ? (data.messages as GeminiMessage[]) : [];
+  for (const message of messages) {
+    const content = typeof message.content === "string" ? message.content : "";
+    if (message.type === "user") {
+      builder.addText("user", content);
+    } else if (message.type === "gemini") {
+      builder.addText("assistant", content);
+      if (Array.isArray(message.toolCalls)) {
+        for (const call of message.toolCalls) {
+          if (typeof call !== "object" || call === null) continue;
+          const tool = call as Record<string, unknown>;
+          if (typeof tool.name === "string") builder.addTool(formatToolCall(tool.name, tool.args));
         }
       }
     }
+  }
 
-    const rendered = renderTranscript(builder.blocks, maxChars);
-    const firstUser = builder.blocks.find((b) => b.role === "user" && b.text.trim());
-    return {
-      agent: "gemini",
-      agentLabel: "Gemini CLI",
-      sessionId: typeof data.sessionId === "string" ? data.sessionId : path.basename(filePath, ".json"),
-      filePath,
-      cwd: null, // not recorded in the session file; discovery already scoped it by cwd hash
-      gitBranch: null,
-      title: firstUser ? snippet(firstUser.text, 80) : null,
-      firstTimestamp: typeof data.startTime === "string" ? data.startTime : null,
-      lastTimestamp: typeof data.lastUpdated === "string" ? data.lastUpdated : null,
-      userMessageCount: rendered.userMessageCount,
-      assistantMessageCount: rendered.assistantMessageCount,
-      transcript: rendered.transcript,
-      truncated: rendered.truncated,
-    };
-  },
-};
+  const rendered = renderTranscript(builder.blocks, maxChars);
+  const firstUser = builder.blocks.find((b) => b.role === "user" && b.text.trim());
+  return {
+    agent: "gemini",
+    agentLabel: "Gemini CLI",
+    sessionId: typeof data.sessionId === "string" ? data.sessionId : path.basename(filePath, ".json"),
+    filePath,
+    cwd: null, // not recorded in the session file; discovery already scoped it by cwd hash
+    gitBranch: null,
+    title: firstUser ? snippet(firstUser.text, 80) : null,
+    firstTimestamp: typeof data.startTime === "string" ? data.startTime : null,
+    lastTimestamp: typeof data.lastUpdated === "string" ? data.lastUpdated : null,
+    userMessageCount: rendered.userMessageCount,
+    assistantMessageCount: rendered.assistantMessageCount,
+    transcript: rendered.transcript,
+    truncated: rendered.truncated,
+  };
+}
+
+/** Gemini's per-cwd store directory — remote discovery recomputes this hash. */
+export function geminiChatsDir(cwd: string, home: string): string {
+  return chatsDir(cwd, home);
+}

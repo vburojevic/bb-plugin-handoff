@@ -3,14 +3,29 @@
 // thread seeded with it.
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { CAPS, captureThread, type CapturedSession, type TranscriptEntry } from "./capture";
+import {
+  captureWorkingState,
+  deliverPatch,
+  planTransfer,
+  TransferError,
+  type TransferPlan,
+  type WorkingState,
+  type WorkspaceMode,
+} from "./machines";
 
-export type WorkspaceMode = "reuse" | "worktree" | "personal";
+export { TransferError } from "./machines";
+export type { TransferPlan, WorkingState, WorkspaceMode } from "./machines";
 
 export interface HandoffRequest {
   sourceThreadId: string;
   providerId: string;
   model?: string;
   workspace: WorkspaceMode;
+  /**
+   * Machine (host id or name) to run the new thread on. Omit to stay on the
+   * source thread's machine.
+   */
+  machine?: string | null;
   extraInstructions?: string;
   /** Capture only events up to this seq (anchored at a chat message). */
   untilSeq?: number;
@@ -38,6 +53,8 @@ export interface HandoffRecord {
   workspace: WorkspaceMode;
   at: number;
   verification?: VerificationState;
+  /** Machine the new thread runs on, when it differs from the source's. */
+  targetMachine?: string | null;
 }
 
 export type BriefingOutcome = "included" | "skipped-busy" | "skipped-unanswered" | "off";
@@ -178,13 +195,87 @@ function renderEntry(entry: TranscriptEntry, sourceProvider: string): string {
   }
 }
 
+export interface RenderOptions {
+  sameFamily?: boolean;
+  /** Where the new thread runs; drives the cross-machine wording. */
+  transfer?: TransferPlan | null;
+  /** Source workspace git state, captured before the transfer. */
+  working?: WorkingState | null;
+  /** Absolute path of the uncommitted patch, on the target machine. */
+  patchPath?: string | null;
+}
+
+/** Prose for the workspace the receiving thread actually gets. */
+function describeTargetWorkspace(transfer: TransferPlan): string {
+  const machine = transfer.hostName ?? "the target machine";
+  switch (transfer.workspace) {
+    case "reuse":
+      return "the same workspace the previous agent used";
+    case "checkout":
+      return `the project's checkout on ${machine} (\`${transfer.checkoutPath}\`)`;
+    case "worktree":
+      return `a fresh git worktree on ${machine}${transfer.baseBranch ? `, based on \`${transfer.baseBranch}\`` : ", based on the default branch"}`;
+    case "personal":
+      return `a blank personal workspace on ${machine} (no repo checkout)`;
+  }
+}
+
+function renderWorkingState(
+  working: WorkingState,
+  transfer: TransferPlan,
+  patchPath: string | null,
+): string {
+  const where = transfer.sourceHostName ?? "the source machine";
+  const lines = [
+    "",
+    `## Working state on ${where}`,
+    "",
+    `The previous agent's workspace was on \`${working.branch ?? "(no branch)"}\`${working.headSha ? ` at commit \`${working.headSha.slice(0, 12)}\`` : ""}.`,
+    "",
+  ];
+  if (!working.dirty) {
+    lines.push("Its working tree was clean — everything it produced is committed, so nothing is stranded there.", "");
+    return lines.join("\n");
+  }
+  lines.push(
+    `**It had uncommitted changes: ${working.files.length} file(s), +${working.insertions}/-${working.deletions}.** Those edits live on ${where} and are NOT present in your workspace unless you apply them.`,
+    "",
+    ...working.files.slice(0, 50).map((file) => `- \`${file.status}\` ${file.path}`),
+    working.files.length > 50 ? `- … and ${working.files.length - 50} more` : "",
+    "",
+  );
+  if (patchPath) {
+    lines.push(
+      `A patch of exactly those uncommitted changes has been written to \`${patchPath}\` on this machine. To pick the work up where it stood:`,
+      "",
+      "```",
+      `git apply --3way ${patchPath}`,
+      "```",
+      "",
+      `Read the patch before applying it, and check \`git status\` afterwards. If it does not apply cleanly your checkout is at a different commit — reconcile before continuing rather than forcing it.${working.patchTruncated ? " NOTE: the patch was truncated to fit, so it is incomplete — treat it as a guide, not the whole change." : ""}`,
+      "",
+    );
+  } else {
+    lines.push(
+      `Those changes could NOT be carried over${working.note ? ` (${working.note})` : ""}. Tell the user before doing work that would conflict with them.`,
+      "",
+    );
+  }
+  return lines.filter((line) => line !== "").join("\n").concat("\n");
+}
+
 export function renderHandoff(
   captured: CapturedSession,
   capturedAt: Date,
   briefing?: string | null,
-  options?: { sameFamily?: boolean },
+  options?: RenderOptions,
 ): string {
   const sameFamily = options?.sameFamily ?? false;
+  const transfer = options?.transfer ?? null;
+  const crossMachine = transfer?.crossMachine ?? false;
+  const sourceMachine = transfer?.sourceHostName ?? "the source machine";
+  const targetMachine = transfer?.hostName ?? "this machine";
+
   const steps = [
     briefing?.trim()
       ? "Read the outgoing agent's briefing and the full transcript below before doing anything else."
@@ -194,14 +285,20 @@ export function renderHandoff(
           "The transcript is YOUR OWN conversation history with this user, continued on a new bb thread. Continue seamlessly: do not re-introduce yourself and do not summarize back what you already know.",
         ]
       : []),
-    "The workspace path above holds the live working state — check `git status` and `git log` there for uncommitted work.",
+    crossMachine
+      ? `You are on a DIFFERENT MACHINE than the previous agent. The source workspace path above is on ${sourceMachine} and does not exist here; you are running in ${transfer ? describeTargetWorkspace(transfer) : "a new workspace"}. Start with \`git status\` and \`git log\` in your own workspace, and read the "Working state" section below before assuming any file is where the transcript left it.`
+      : "The workspace path above holds the live working state — check `git status` and `git log` there for uncommitted work.",
     "Continue from where the previous agent left off. Do not redo completed steps; honor decisions already made unless the user says otherwise.",
     ...(captured.nativeSessionPath
-      ? [
-          sameFamily
-            ? "The native session file above is your own full session log (JSONL). When you need exact detail this rendered transcript truncated — precise file contents, complete command output — read that file directly; it is the authoritative record."
-            : "If you need raw detail the transcript truncated, the native session file above contains the source provider's full session (JSONL).",
-        ]
+      ? crossMachine
+        ? [
+            `The source provider's native session file (\`${captured.nativeSessionPath}\`) is on ${sourceMachine} and is not readable from here — this document is your complete record.`,
+          ]
+        : [
+            sameFamily
+              ? "The native session file above is your own full session log (JSONL). When you need exact detail this rendered transcript truncated — precise file contents, complete command output — read that file directly; it is the authoritative record."
+              : "If you need raw detail the transcript truncated, the native session file above contains the source provider's full session (JSONL).",
+          ]
       : []),
     `The previous agent is still reachable in bb thread \`${captured.threadId}\`. If something essential is unclear, ask it directly: \`bb thread tell ${captured.threadId} "<your question>" --mode queue\`, then \`bb thread wait ${captured.threadId}\` and \`bb thread output ${captured.threadId}\` to read the answer. Ask at most once or twice, then continue on your own — that agent no longer owns this task.`,
   ];
@@ -211,7 +308,14 @@ export function renderHandoff(
     "",
     `- Source thread: ${captured.title} (\`${captured.threadId}\`)`,
     `- Source provider: ${captured.providerId}`,
-    `- Workspace: ${captured.workspacePath ?? "(none)"}${captured.branchName ? ` (branch \`${captured.branchName}\`)` : ""}`,
+    crossMachine
+      ? `- Machine: handed off from ${sourceMachine} to ${targetMachine} — this thread runs on ${targetMachine}`
+      : transfer?.hostName
+        ? `- Machine: ${transfer.hostName}`
+        : null,
+    `- Source workspace${crossMachine ? ` (on ${sourceMachine})` : ""}: ${captured.workspacePath ?? "(none)"}${captured.branchName ? ` (branch \`${captured.branchName}\`)` : ""}`,
+    crossMachine && transfer ? `- Your workspace: ${describeTargetWorkspace(transfer)}` : null,
+    ...(transfer?.notes ?? []).map((note) => `- Note: ${note}`),
     `- Captured: ${capturedAt.toISOString()} — ${captured.turns} turns, ${captured.entries.length} transcript entries`,
     captured.untilSeq != null
       ? `- Scope: partial capture — the conversation only up to a message the user selected (events up to seq ${captured.untilSeq}); anything the source thread did after that message is intentionally excluded`
@@ -246,13 +350,18 @@ export function renderHandoff(
       ].join("\n")
     : "";
 
+  const workingSection =
+    options?.working && transfer
+      ? renderWorkingState(options.working, transfer, options.patchPath ?? null)
+      : "";
+
   const rendered = captured.entries.map((entry) => renderEntry(entry, captured.providerId));
   const transcript = fitTranscript(
     rendered,
-    CAPS.totalDocBytes - header.length - latest.length - briefingSection.length,
+    CAPS.totalDocBytes - header.length - latest.length - briefingSection.length - workingSection.length,
   );
 
-  return `${header}${latest}${briefingSection}\n## Transcript\n\n${transcript}\n`;
+  return `${header}${workingSection}${latest}${briefingSection}\n## Transcript\n\n${transcript}\n`;
 }
 
 /** Keep the head and tail of the transcript when the whole thing won't fit. */
@@ -284,16 +393,28 @@ export function buildIntroPrompt(
   captured: CapturedSession,
   request: HandoffRequest,
   hasBriefing = false,
+  context?: { transfer?: TransferPlan | null; patchPath?: string | null },
 ): string {
   const sameFamily = request.providerId === captured.providerId;
+  const transfer = context?.transfer ?? null;
   const lines = [
     sameFamily
       ? "You are continuing YOUR OWN in-progress session on a new bb thread (same provider, new thread)."
       : `You are taking over an in-progress agent session handed off from ${captured.providerId}.`,
+    ...(transfer?.crossMachine
+      ? [
+          `This thread runs on a different machine (${transfer.hostName ?? "this machine"}) than the session it continues (${transfer.sourceHostName ?? "the source machine"}), so the previous agent's files are not simply here — the handoff document explains what your workspace contains.`,
+        ]
+      : []),
     "Read the attached handoff document in full — it contains the complete conversation transcript and the current state of the work.",
     ...(hasBriefing
       ? [
           "It also contains a briefing the outgoing agent wrote moments before this handoff — treat it as the freshest statement of state and intent.",
+        ]
+      : []),
+    ...(context?.patchPath
+      ? [
+          `The source machine had uncommitted changes; a patch of them is at ${context.patchPath} on this machine. Follow the handoff document's "Working state" section before you edit anything.`,
         ]
       : []),
     "Then reply with one short paragraph confirming where the work stands, and continue from that point. Do not redo completed work.",
@@ -305,21 +426,31 @@ export function buildIntroPrompt(
 }
 
 // deno-lint-ignore no-explicit-any
-function resolveEnvironment(request: HandoffRequest, captured: CapturedSession): any {
-  if (request.workspace === "reuse") {
+function resolveEnvironment(plan: TransferPlan, captured: CapturedSession): any {
+  if (plan.workspace === "reuse") {
     if (!captured.environmentId) {
-      throw new Error("Source thread has no environment to reuse — pick worktree or personal.");
+      throw new TransferError("Source thread has no environment to reuse — pick worktree or personal.");
     }
     return { type: "reuse", environmentId: captured.environmentId };
   }
-  if (request.workspace === "worktree") {
+  if (plan.workspace === "checkout") {
     return {
       type: "host",
-      hostId: captured.hostId,
-      workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+      hostId: plan.hostId,
+      workspace: { type: "unmanaged", path: plan.checkoutPath },
     };
   }
-  return { type: "host", hostId: captured.hostId, workspace: { type: "personal" } };
+  if (plan.workspace === "worktree") {
+    return {
+      type: "host",
+      hostId: plan.hostId,
+      workspace: {
+        type: "managed-worktree",
+        baseBranch: plan.baseBranch ? { kind: "named", name: plan.baseBranch } : { kind: "default" },
+      },
+    };
+  }
+  return { type: "host", hostId: plan.hostId, workspace: { type: "personal" } };
 }
 
 export interface HandoffResult {
@@ -327,6 +458,12 @@ export interface HandoffResult {
   attachmentPath: string;
   docBytes: number;
   briefing: BriefingOutcome;
+  /** Target machine name, when the handoff crossed machines. */
+  targetMachine: string | null;
+  crossMachine: boolean;
+  /** Where the source's uncommitted patch landed on the target machine. */
+  patchPath: string | null;
+  notes: string[];
 }
 
 export async function startHandoff(bb: BbPluginApi, request: HandoffRequest): Promise<HandoffResult> {
@@ -348,6 +485,18 @@ async function runHandoff(
   publish("capturing");
   const captured = await captureThread(bb, request.sourceThreadId, { untilSeq: request.untilSeq });
 
+  // Decide where this lands before doing any expensive work, so an impossible
+  // transfer fails fast instead of after a briefing round-trip and an upload.
+  const transfer = await planTransfer(bb, {
+    projectId: captured.projectId,
+    sourceHostId: captured.hostId,
+    sourceBranch: captured.branchName,
+    hasEnvironment: captured.environmentId != null,
+    workspace: request.workspace,
+    machine: request.machine,
+  });
+  const environment = resolveEnvironment(transfer, captured);
+
   // The capture snapshot is taken first, so the briefing exchange below never
   // appears in the transcript — it travels only as its own document section.
   let briefing: string | null = null;
@@ -359,9 +508,35 @@ async function runHandoff(
     briefingOutcome = result.outcome;
   }
 
+  // Only a machine hop strands the working tree: every same-machine mode either
+  // reuses the workspace or sits beside it on the same disk.
+  let working: WorkingState | null = null;
+  let patchPath: string | null = null;
+  if (transfer.crossMachine && captured.environmentId) {
+    publish("working-state");
+    working = await captureWorkingState(bb, captured.environmentId);
+    if (working?.patch && transfer.hostId) {
+      patchPath = await deliverPatch(bb, {
+        hostId: transfer.hostId,
+        sourceThreadId: request.sourceThreadId,
+        patch: working.patch,
+      });
+      if (!patchPath) {
+        transfer.notes.push(
+          `The source workspace has uncommitted changes, but the patch could not be written to ${transfer.hostName ?? "the target machine"}.`,
+        );
+      }
+    }
+  }
+
   publish("rendering");
   const sameFamily = request.providerId === captured.providerId;
-  const doc = renderHandoff(captured, new Date(), briefing, { sameFamily });
+  const doc = renderHandoff(captured, new Date(), briefing, {
+    sameFamily,
+    transfer,
+    working,
+    patchPath,
+  });
   const bytes = new TextEncoder().encode(doc);
 
   publish("uploading");
@@ -377,10 +552,14 @@ async function runHandoff(
     projectId: captured.projectId,
     providerId: request.providerId,
     ...(request.model ? { model: request.model } : {}),
-    environment: resolveEnvironment(request, captured),
+    environment,
     title: `${captured.untilSeq != null ? "Handoff from message" : "Handoff"}: ${captured.title}`,
     input: [
-      { type: "text", text: buildIntroPrompt(captured, request, briefing != null), mentions: [] },
+      {
+        type: "text",
+        text: buildIntroPrompt(captured, request, briefing != null, { transfer, patchPath }),
+        mentions: [],
+      },
       {
         type: "localFile",
         path: uploaded.path,
@@ -400,6 +579,7 @@ async function runHandoff(
     workspace: request.workspace,
     at: Date.now(),
     verification: "pending",
+    targetMachine: transfer.crossMachine ? transfer.hostName : null,
   };
   const kvKey = `handoff:${record.at}:${thread.id}`;
   await bb.storage.kv.set(kvKey, record);
@@ -410,12 +590,16 @@ async function runHandoff(
     expiresAt: Date.now() + VERIFICATION_TTL_MS,
   });
 
-  publish("done", { newThreadId: thread.id });
+  publish("done", { newThreadId: thread.id, targetMachine: record.targetMachine });
   return {
     newThreadId: thread.id,
     attachmentPath: uploaded.path,
     docBytes: bytes.byteLength,
     briefing: briefingOutcome,
+    targetMachine: transfer.hostName,
+    crossMachine: transfer.crossMachine,
+    patchPath,
+    notes: transfer.notes,
   };
 }
 

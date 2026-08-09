@@ -16,10 +16,19 @@ import {
   settleBriefing,
   settleVerification,
   startHandoff,
+  TransferError,
   type WorkspaceMode,
 } from "./handoff";
+import {
+  captureWorkingState,
+  listMachines,
+  matchMachine,
+  planTransfer,
+  sourcePathOnHost,
+  type TransferPlan,
+} from "./machines";
 
-const workspaceModeSchema = z.enum(["reuse", "worktree", "personal"]);
+const workspaceModeSchema = z.enum(["reuse", "checkout", "worktree", "personal"]);
 
 /** Event-seq cutoff of one chat message; scopes the capture to everything up to it. */
 const upToSeqField = z.number().int().positive().optional();
@@ -41,7 +50,8 @@ export const rpcContract = defineRpcContract({
     }),
   },
   listTargets: {
-    input: z.object({ threadId: z.string() }).strict(),
+    /** machineId re-scopes provider discovery to the machine being targeted. */
+    input: z.object({ threadId: z.string(), machineId: z.string().optional() }).strict(),
     output: z.object({
       providers: z.array(
         z.object({
@@ -51,6 +61,17 @@ export const rpcContract = defineRpcContract({
           logoUrl: z.string().nullable(),
         }),
       ),
+      machines: z.array(
+        z.object({
+          id: z.string(),
+          name: z.string(),
+          connected: z.boolean(),
+          isSource: z.boolean(),
+          /** Whether this project has a checkout there (gates "checkout"). */
+          hasCheckout: z.boolean(),
+        }),
+      ),
+      sourceMachineId: z.string().nullable(),
     }),
   },
   previewHandoff: {
@@ -62,7 +83,9 @@ export const rpcContract = defineRpcContract({
     }),
   },
   listModels: {
-    input: z.object({ threadId: z.string(), providerId: z.string() }).strict(),
+    input: z
+      .object({ threadId: z.string(), providerId: z.string(), machineId: z.string().optional() })
+      .strict(),
     output: z.object({
       models: z.array(z.object({ model: z.string(), displayName: z.string() })),
     }),
@@ -74,6 +97,7 @@ export const rpcContract = defineRpcContract({
         providerId: z.string(),
         model: z.string().optional(),
         workspace: workspaceModeSchema,
+        machineId: z.string().optional(),
         extraInstructions: z.string().optional(),
         upToSeq: upToSeqField,
         briefing: z.boolean().optional(),
@@ -83,6 +107,10 @@ export const rpcContract = defineRpcContract({
       newThreadId: z.string(),
       docBytes: z.number(),
       briefing: z.enum(["included", "skipped-busy", "skipped-unanswered", "off"]),
+      targetMachine: z.string().nullable(),
+      crossMachine: z.boolean(),
+      patchPath: z.string().nullable(),
+      notes: z.array(z.string()),
     }),
   },
   history: {
@@ -98,6 +126,7 @@ export const rpcContract = defineRpcContract({
           workspace: workspaceModeSchema,
           at: z.number(),
           verification: z.enum(["pending", "confirmed", "failed"]).optional(),
+          targetMachine: z.string().nullable().optional(),
         }),
       ),
     }),
@@ -108,6 +137,23 @@ async function environmentIdOfThread(bb: BbPluginApi, threadId: string): Promise
   // deno-lint-ignore no-explicit-any
   const thread = (await bb.sdk.threads.get({ threadId })) as any;
   return thread.environmentId ?? null;
+}
+
+/** The machine a thread runs on, and the project it belongs to. */
+async function threadLocation(
+  bb: BbPluginApi,
+  threadId: string,
+): Promise<{ projectId: string | null; hostId: string | null }> {
+  // deno-lint-ignore no-explicit-any
+  const thread = (await bb.sdk.threads.get({ threadId })) as any;
+  const projectId: string | null = thread.projectId ?? null;
+  if (!thread.environmentId) return { projectId, hostId: null };
+  try {
+    const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
+    return { projectId, hostId: environment.hostId ?? null };
+  } catch {
+    return { projectId, hostId: null };
+  }
 }
 
 export default async function plugin(bb: BbPluginApi) {
@@ -143,10 +189,22 @@ export default async function plugin(bb: BbPluginApi) {
         hasEnvironment: captured.environmentId != null,
       };
     },
-    async listTargets({ threadId }) {
-      const environmentId = await environmentIdOfThread(bb, threadId);
+    async listTargets({ threadId, machineId }) {
+      const [{ projectId, hostId }, machines] = await Promise.all([
+        threadLocation(bb, threadId),
+        listMachines(bb).catch(() => []),
+      ]);
+      const target = machineId ? matchMachine(machines, machineId) : null;
+      // Providers are discovered per machine: the target's CLIs decide what
+      // this handoff can actually land on, not the source's.
+      const environmentId = target ? null : await environmentIdOfThread(bb, threadId);
       const providers = await bb.sdk.providers.list(
-        environmentId ? { environmentId } : undefined,
+        target ? { hostId: target.id } : environmentId ? { environmentId } : undefined,
+      );
+      const checkouts = await Promise.all(
+        machines.map(async (machine) =>
+          projectId ? Boolean(await sourcePathOnHost(bb, projectId, machine.id)) : false,
+        ),
       );
       return {
         providers: providers.map((provider) => ({
@@ -155,6 +213,14 @@ export default async function plugin(bb: BbPluginApi) {
           available: provider.available,
           logoUrl: provider.logoUrl ?? null,
         })),
+        machines: machines.map((machine, index) => ({
+          id: machine.id,
+          name: machine.name,
+          connected: machine.connected,
+          isSource: machine.id === hostId,
+          hasCheckout: checkouts[index] ?? false,
+        })),
+        sourceMachineId: hostId,
       };
     },
     async previewHandoff({ threadId, upToSeq }) {
@@ -169,10 +235,16 @@ export default async function plugin(bb: BbPluginApi) {
         truncated,
       };
     },
-    async listModels({ threadId, providerId }) {
-      const environmentId = await environmentIdOfThread(bb, threadId);
+    async listModels({ threadId, providerId, machineId }) {
+      const machines = machineId ? await listMachines(bb).catch(() => []) : [];
+      const target = machineId ? matchMachine(machines, machineId) : null;
+      const environmentId = target ? null : await environmentIdOfThread(bb, threadId);
       const options = await bb.sdk.providers.models(
-        environmentId ? { environmentId, providerId } : { providerId },
+        target
+          ? { hostId: target.id, providerId }
+          : environmentId
+            ? { environmentId, providerId }
+            : { providerId },
       );
       return {
         models: options.models.map((model) => ({
@@ -181,18 +253,37 @@ export default async function plugin(bb: BbPluginApi) {
         })),
       };
     },
-    async startHandoff({ threadId, providerId, model, workspace, extraInstructions, upToSeq, briefing }) {
+    async startHandoff({
+      threadId,
+      providerId,
+      model,
+      workspace,
+      machineId,
+      extraInstructions,
+      upToSeq,
+      briefing,
+    }) {
       const result = await startHandoff(bb, {
         sourceThreadId: threadId,
         providerId,
         model,
         workspace,
+        machine: machineId,
         extraInstructions,
         untilSeq: upToSeq,
         briefing,
       });
-      bb.log.info(`handoff ${threadId} → ${providerId} (${result.newThreadId})`);
-      return { newThreadId: result.newThreadId, docBytes: result.docBytes, briefing: result.briefing };
+      const where = result.crossMachine ? ` on ${result.targetMachine}` : "";
+      bb.log.info(`handoff ${threadId} → ${providerId}${where} (${result.newThreadId})`);
+      return {
+        newThreadId: result.newThreadId,
+        docBytes: result.docBytes,
+        briefing: result.briefing,
+        targetMachine: result.targetMachine,
+        crossMachine: result.crossMachine,
+        patchPath: result.patchPath,
+        notes: result.notes,
+      };
     },
     async history() {
       return { handoffs: await listHandoffs(bb) };
@@ -206,9 +297,10 @@ export default async function plugin(bb: BbPluginApi) {
       ...adoptCommandSpecs,
       {
         name: "start",
-        summary: "Capture a thread and spawn a new thread on another provider seeded with it",
+        summary:
+          "Capture a thread and spawn a new thread on another provider — and optionally another machine — seeded with it",
         usage:
-          "bb handoff <thread-id|--self> --to <provider> [--model <model>] [--workspace reuse|worktree|personal] [--instructions <text>] [--up-to-seq <n>] [--briefing] [--dry-run]",
+          "bb handoff <thread-id|--self> --to <provider> [--machine <host>] [--model <model>] [--workspace reuse|checkout|worktree|personal] [--instructions <text>] [--up-to-seq <n>] [--briefing] [--dry-run]",
       },
       {
         name: "export",
@@ -248,13 +340,17 @@ export default async function plugin(bb: BbPluginApi) {
 
       if (command === "help" || flags.has("--help")) {
         const help = [
-          "bb handoff — move a session between agents, in both directions",
+          "bb handoff — move a session between agents and machines, in both directions",
           "",
-          "  bb handoff <thread-id|--self> --to <provider> [--model <m>] [--workspace reuse|worktree|personal]",
+          "  bb handoff <thread-id|--self> --to <provider> [--machine <host>] [--model <m>]",
+          "             [--workspace reuse|checkout|worktree|personal]",
           "             [--instructions <text>] [--up-to-seq <n>] [--briefing] [--dry-run]",
           "             --briefing asks the (idle) source agent for a handoff note first",
+          "             --machine runs the new thread on another enrolled machine. The source's",
+          "             uncommitted work travels with it as a patch; reuse is same-machine only,",
+          "             so pick checkout (that machine's project checkout), worktree, or personal.",
           "  bb handoff export <thread-id|--self> [--out <path>]",
-          "  bb handoff targets [--thread <thread-id>] [--json]",
+          "  bb handoff targets [--thread <thread-id>] [--machine <host>] [--json]",
           "  bb handoff list [--json]",
           "  bb handoff adopt …   (see `bb handoff adopt help`)",
         ].join("\n");
@@ -269,27 +365,49 @@ export default async function plugin(bb: BbPluginApi) {
         if (handoffs.length === 0) return { exitCode: 0, stdout: "No handoffs recorded yet.\n" };
         const lines = handoffs.map(
           (record) =>
-            `${new Date(record.at).toISOString()}  ${record.sourceThreadId} (${record.sourceProvider}) → ${record.targetThreadId} (${record.targetProvider}${record.model ? `/${record.model}` : ""}, ${record.workspace})`,
+            `${new Date(record.at).toISOString()}  ${record.sourceThreadId} (${record.sourceProvider}) → ${record.targetThreadId} (${record.targetProvider}${record.model ? `/${record.model}` : ""}, ${record.workspace}${record.targetMachine ? ` @ ${record.targetMachine}` : ""})`,
         );
         return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
       }
 
       if (command === "targets") {
         const threadId = flags.get("--thread") ?? ctx.threadId;
-        const environmentId = threadId ? await environmentIdOfThread(bb, threadId) : null;
-        const providers = await bb.sdk.providers.list(environmentId ? { environmentId } : undefined);
+        const machineFlag = flags.get("--machine");
+        const machines = await listMachines(bb).catch(() => []);
+        const target = machineFlag ? matchMachine(machines, machineFlag) : null;
+        if (machineFlag && !target) {
+          return fail(
+            `Unknown machine "${machineFlag}". Enrolled machines: ${machines.map((m) => m.name).join(", ") || "(none)"}`,
+          );
+        }
+        const environmentId =
+          target || !threadId ? null : await environmentIdOfThread(bb, threadId);
+        const providers = await bb.sdk.providers.list(
+          target ? { hostId: target.id } : environmentId ? { environmentId } : undefined,
+        );
         if (flags.has("--json")) {
           const payload = providers.map((provider) => ({
             id: provider.id,
             displayName: provider.displayName,
             available: provider.available,
           }));
-          return { exitCode: 0, stdout: `${JSON.stringify({ providers: payload }, null, 2)}\n` };
+          return {
+            exitCode: 0,
+            stdout: `${JSON.stringify({ machine: target?.name ?? null, providers: payload, machines }, null, 2)}\n`,
+          };
         }
         const lines = providers.map(
           (provider) => `${provider.id}\t${provider.displayName}${provider.available ? "" : "\t(unavailable)"}`,
         );
-        return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
+        const machineLines = machines.map(
+          (machine) =>
+            `${machine.name}\t${machine.id}${machine.connected ? "" : "\t(disconnected)"}${machine.isPrimary ? "\t(primary)" : ""}`,
+        );
+        const header = target ? `Providers on ${target.name}:\n` : "";
+        return {
+          exitCode: 0,
+          stdout: `${header}${lines.join("\n")}\n\nMachines:\n${machineLines.join("\n")}\n`,
+        };
       }
 
       if (command === "export") {
@@ -318,9 +436,12 @@ export default async function plugin(bb: BbPluginApi) {
         const threadId = resolveThreadId(positional[0]);
         if (!threadId) return fail("No thread. Pass a thread id or run with --self inside a bb thread.");
         const providerId = flags.get("--to");
-        const workspace = (flags.get("--workspace") ?? "reuse") as WorkspaceMode;
+        const machine = flags.get("--machine") || undefined;
+        // Crossing machines cannot reuse the source environment, so a bare
+        // --machine defaults to that machine's checkout of the same project.
+        const workspace = (flags.get("--workspace") ?? (machine ? "checkout" : "reuse")) as WorkspaceMode;
         if (!workspaceModeSchema.safeParse(workspace).success) {
-          return fail("--workspace must be reuse, worktree, or personal.");
+          return fail("--workspace must be reuse, checkout, worktree, or personal.");
         }
         const upToSeqRaw = flags.get("--up-to-seq");
         const upToSeq = upToSeqRaw ? Number.parseInt(upToSeqRaw, 10) : undefined;
@@ -329,7 +450,25 @@ export default async function plugin(bb: BbPluginApi) {
         }
         if (flags.has("--dry-run")) {
           const captured = await captureThread(bb, threadId, { untilSeq: upToSeq });
-          const doc = renderHandoff(captured, new Date());
+          let plan: TransferPlan;
+          try {
+            plan = await planTransfer(bb, {
+              projectId: captured.projectId,
+              sourceHostId: captured.hostId,
+              sourceBranch: captured.branchName,
+              hasEnvironment: captured.environmentId != null,
+              workspace,
+              machine,
+            });
+          } catch (error) {
+            if (error instanceof TransferError) return fail(error.message);
+            throw error;
+          }
+          const doc = renderHandoff(captured, new Date(), null, { transfer: plan });
+          const working =
+            plan.crossMachine && captured.environmentId
+              ? await captureWorkingState(bb, captured.environmentId)
+              : null;
           const stats = [
             `Source: ${captured.title} (${captured.providerId}, ${threadId})`,
             `Turns: ${captured.turns}, transcript entries: ${captured.entries.length}, events: ${captured.eventCount}`,
@@ -337,22 +476,44 @@ export default async function plugin(bb: BbPluginApi) {
             `Scope: ${captured.untilSeq != null ? `partial — events up to seq ${captured.untilSeq}` : "full thread"}`,
             `Native session file: ${captured.nativeSessionPath ?? "(not found)"}`,
             `Workspace: ${captured.workspacePath ?? "(none)"}`,
+            `Target machine: ${plan.hostName ?? "(source machine)"}${plan.crossMachine ? " — cross-machine handoff" : ""}`,
+            `Target workspace: ${plan.workspace}${plan.checkoutPath ? ` (${plan.checkoutPath})` : ""}${plan.baseBranch ? ` based on ${plan.baseBranch}` : ""}`,
+            ...(working?.dirty
+              ? [
+                  `Uncommitted work to carry: ${working.files.length} file(s), +${working.insertions}/-${working.deletions}${working.patch ? "" : " — NO PATCH AVAILABLE"}`,
+                ]
+              : plan.crossMachine
+                ? ["Uncommitted work to carry: none (source tree is clean)"]
+                : []),
+            ...plan.notes.map((note) => `Note: ${note}`),
           ];
           return { exitCode: 0, stdout: `${stats.join("\n")}\n` };
         }
         if (!providerId) return fail("Missing --to <provider>. See `bb handoff targets`.");
-        const result = await startHandoff(bb, {
-          sourceThreadId: threadId,
-          providerId,
-          model: flags.get("--model"),
-          workspace,
-          extraInstructions: flags.get("--instructions"),
-          untilSeq: upToSeq,
-          briefing: flags.has("--briefing"),
-        });
+        let result: Awaited<ReturnType<typeof startHandoff>>;
+        try {
+          result = await startHandoff(bb, {
+            sourceThreadId: threadId,
+            providerId,
+            model: flags.get("--model"),
+            workspace,
+            machine,
+            extraInstructions: flags.get("--instructions"),
+            untilSeq: upToSeq,
+            briefing: flags.has("--briefing"),
+          });
+        } catch (error) {
+          if (error instanceof TransferError) return fail(error.message);
+          throw error;
+        }
+        const where = result.crossMachine ? ` on ${result.targetMachine}` : "";
+        const extra = [
+          result.patchPath ? `Carried the source's uncommitted changes to ${result.patchPath}.` : "",
+          ...result.notes,
+        ].filter(Boolean);
         return {
           exitCode: 0,
-          stdout: `Handed off ${threadId} → ${providerId}. New thread: ${result.newThreadId} (doc ${result.docBytes} bytes)\n`,
+          stdout: `Handed off ${threadId} → ${providerId}${where}. New thread: ${result.newThreadId} (doc ${result.docBytes} bytes)\n${extra.map((line) => `${line}\n`).join("")}`,
         };
       }
 

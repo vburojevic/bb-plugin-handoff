@@ -54,7 +54,7 @@ function query(dbPath: string, sql: string): Record<string, unknown>[] {
   }
 }
 
-interface SessionRow {
+export interface SessionRow {
   id: string;
   directory: string;
   title: string;
@@ -62,7 +62,34 @@ interface SessionRow {
   time_updated: number;
 }
 
-const SESSION_COLUMNS = "id, directory, title, time_created, time_updated";
+export const SESSION_COLUMNS = "id, directory, title, time_created, time_updated";
+
+/** The three queries a full session read needs, as SQL a remote sqlite3 can run. */
+export function opencodeSql(sessionId: string): {
+  session: string;
+  messages: string;
+  parts: string;
+} {
+  const id = escapeSqlLiteral(sessionId);
+  return {
+    session: `SELECT ${SESSION_COLUMNS} FROM session WHERE id='${id}'`,
+    messages: `SELECT id, data FROM message WHERE session_id='${id}' ORDER BY time_created, id`,
+    parts: `SELECT message_id, data FROM part WHERE session_id='${id}' ORDER BY time_created, id`,
+  };
+}
+
+export function opencodeListSql(cwd: string): string {
+  return `SELECT ${SESSION_COLUMNS} FROM session WHERE directory='${escapeSqlLiteral(cwd)}' AND parent_id IS NULL ORDER BY time_updated DESC LIMIT 50`;
+}
+
+export function opencodeFindSql(idOrPrefix: string): string {
+  const needle = escapeSqlLiteral(idOrPrefix.replaceAll("%", "").replaceAll("_", "\\_"));
+  return `SELECT ${SESSION_COLUMNS} FROM session WHERE id LIKE '${needle}%' ESCAPE '\\' ORDER BY time_updated DESC LIMIT 10`;
+}
+
+export function opencodeSummary(dbPath: string, row: SessionRow): SessionSummary {
+  return toSummary(dbPath, row);
+}
 
 function toSummary(dbPath: string, row: SessionRow): SessionSummary {
   return {
@@ -82,117 +109,121 @@ export const opencodeAdapter: AgentAdapter = {
 
   list(cwd: string, home: string = os.homedir()): SessionSummary[] {
     const dbPath = opencodeDbPath(home);
-    const rows = query(
-      dbPath,
-      `SELECT ${SESSION_COLUMNS} FROM session WHERE directory='${escapeSqlLiteral(cwd)}' AND parent_id IS NULL ORDER BY time_updated DESC LIMIT 50`,
-    ) as unknown as SessionRow[];
+    const rows = query(dbPath, opencodeListSql(cwd)) as unknown as SessionRow[];
     return rows.map((row) => toSummary(dbPath, row));
   },
 
   find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): FoundSession[] {
     const dbPath = opencodeDbPath(options.home ?? os.homedir());
-    const needle = escapeSqlLiteral(idOrPrefix.replaceAll("%", "").replaceAll("_", "\\_"));
-    const rows = query(
-      dbPath,
-      `SELECT ${SESSION_COLUMNS} FROM session WHERE id LIKE '${needle}%' ESCAPE '\\' ORDER BY time_updated DESC LIMIT 10`,
-    ) as unknown as SessionRow[];
+    const rows = query(dbPath, opencodeFindSql(idOrPrefix)) as unknown as SessionRow[];
     return rows.map((row) => ({ ...toSummary(dbPath, row), cwd: row.directory ?? null }));
   },
 
   parse(filePath: string, options: { maxChars?: number } = {}): ParsedSession {
-    const maxChars = options.maxChars ?? 150_000;
     const separator = filePath.lastIndexOf("#");
     const dbPath = separator === -1 ? filePath : filePath.slice(0, separator);
     const sessionId = separator === -1 ? "" : filePath.slice(separator + 1);
-    const escapedId = escapeSqlLiteral(sessionId);
+    const sql = opencodeSql(sessionId);
 
-    const sessionRows = query(
-      dbPath,
-      `SELECT ${SESSION_COLUMNS} FROM session WHERE id='${escapedId}'`,
-    ) as unknown as SessionRow[];
+    const sessionRows = query(dbPath, sql.session) as unknown as SessionRow[];
     const session = sessionRows[0];
     if (!session) throw new Error(`No OpenCode session ${sessionId} in ${dbPath}`);
-
-    const messageRows = query(
-      dbPath,
-      `SELECT id, data FROM message WHERE session_id='${escapedId}' ORDER BY time_created, id`,
-    );
-    const partRows = query(
-      dbPath,
-      `SELECT message_id, data FROM part WHERE session_id='${escapedId}' ORDER BY time_created, id`,
-    );
-
-    const partsByMessage = new Map<string, Record<string, unknown>[]>();
-    for (const row of partRows) {
-      const messageId = typeof row.message_id === "string" ? row.message_id : "";
-      const data = parseData(row.data);
-      if (!messageId || !data) continue;
-      const bucket = partsByMessage.get(messageId);
-      if (bucket) bucket.push(data);
-      else partsByMessage.set(messageId, [data]);
-    }
-
-    const builder = new BlockBuilder();
-    let cwd: string | null = session.directory ?? null;
-    let firstTimestamp: string | null = null;
-    let lastTimestamp: string | null = null;
-    for (const row of messageRows) {
-      const messageId = typeof row.id === "string" ? row.id : "";
-      const data = parseData(row.data);
-      if (!data) continue;
-      const role = data.role;
-      const time = (data.time as { created?: number } | undefined)?.created;
-      if (typeof time === "number") {
-        const iso = new Date(time).toISOString();
-        firstTimestamp ??= iso;
-        lastTimestamp = iso;
-      }
-      const messageCwd = (data.path as { cwd?: string } | undefined)?.cwd;
-      if (typeof messageCwd === "string") cwd ??= messageCwd;
-
-      const parts = partsByMessage.get(messageId) ?? [];
-      const texts: string[] = [];
-      const tools: string[] = [];
-      for (const part of parts) {
-        if (part.type === "text" && typeof part.text === "string") texts.push(part.text);
-        else if (part.type === "tool" && typeof part.tool === "string") {
-          tools.push(formatToolCall(part.tool, (part.state as { input?: unknown } | undefined)?.input));
-        }
-        // reasoning / step / snapshot / file parts are omitted
-      }
-      if (role === "user") {
-        const joined = texts.join("\n\n");
-        if (!isInjectedUserText(joined)) builder.addText("user", joined);
-      } else if (role === "assistant") {
-        builder.addText("assistant", texts.join("\n\n"));
-        for (const tool of tools) builder.addTool(tool);
-      }
-    }
-
-    const rendered = renderTranscript(builder.blocks, maxChars);
-    const firstUser = builder.blocks.find((b) => b.role === "user" && b.text.trim());
-    const title = session.title?.startsWith("New session - ")
-      ? firstUser
-        ? snippet(firstUser.text, 80)
-        : null
-      : (session.title ?? null);
-    return {
-      agent: "opencode",
-      agentLabel: "OpenCode",
-      sessionId: session.id,
+    return parseOpencodeRows(
+      { session, messages: query(dbPath, sql.messages), parts: query(dbPath, sql.parts) },
       filePath,
-      cwd,
-      gitBranch: null,
-      title,
-      firstTimestamp,
-      lastTimestamp: lastTimestamp ?? new Date(session.time_updated).toISOString(),
-      userMessageCount: rendered.userMessageCount,
-      assistantMessageCount: rendered.assistantMessageCount,
-      transcript: rendered.transcript,
-      truncated: rendered.truncated,
-    };
+      options,
+    );
   },
 };
+
+export interface OpencodeRows {
+  session: SessionRow;
+  messages: Record<string, unknown>[];
+  parts: Record<string, unknown>[];
+}
+
+/**
+ * Turn raw session/message/part rows into a transcript. Split from the query
+ * layer so a remote sqlite3 can supply the same rows as JSON.
+ */
+export function parseOpencodeRows(
+  rows: OpencodeRows,
+  filePath: string,
+  options: { maxChars?: number } = {},
+): ParsedSession {
+  const maxChars = options.maxChars ?? 150_000;
+  const { session, messages: messageRows, parts: partRows } = rows;
+
+  const partsByMessage = new Map<string, Record<string, unknown>[]>();
+  for (const row of partRows) {
+    const messageId = typeof row.message_id === "string" ? row.message_id : "";
+    const data = parseData(row.data);
+    if (!messageId || !data) continue;
+    const bucket = partsByMessage.get(messageId);
+    if (bucket) bucket.push(data);
+    else partsByMessage.set(messageId, [data]);
+  }
+
+  const builder = new BlockBuilder();
+  let cwd: string | null = session.directory ?? null;
+  let firstTimestamp: string | null = null;
+  let lastTimestamp: string | null = null;
+  for (const row of messageRows) {
+    const messageId = typeof row.id === "string" ? row.id : "";
+    const data = parseData(row.data);
+    if (!data) continue;
+    const role = data.role;
+    const time = (data.time as { created?: number } | undefined)?.created;
+    if (typeof time === "number") {
+      const iso = new Date(time).toISOString();
+      firstTimestamp ??= iso;
+      lastTimestamp = iso;
+    }
+    const messageCwd = (data.path as { cwd?: string } | undefined)?.cwd;
+    if (typeof messageCwd === "string") cwd ??= messageCwd;
+
+    const parts = partsByMessage.get(messageId) ?? [];
+    const texts: string[] = [];
+    const tools: string[] = [];
+    for (const part of parts) {
+      if (part.type === "text" && typeof part.text === "string") texts.push(part.text);
+      else if (part.type === "tool" && typeof part.tool === "string") {
+        tools.push(formatToolCall(part.tool, (part.state as { input?: unknown } | undefined)?.input));
+      }
+      // reasoning / step / snapshot / file parts are omitted
+    }
+    if (role === "user") {
+      const joined = texts.join("\n\n");
+      if (!isInjectedUserText(joined)) builder.addText("user", joined);
+    } else if (role === "assistant") {
+      builder.addText("assistant", texts.join("\n\n"));
+      for (const tool of tools) builder.addTool(tool);
+    }
+  }
+
+  const rendered = renderTranscript(builder.blocks, maxChars);
+  const firstUser = builder.blocks.find((b) => b.role === "user" && b.text.trim());
+  const title = session.title?.startsWith("New session - ")
+    ? firstUser
+      ? snippet(firstUser.text, 80)
+      : null
+    : (session.title ?? null);
+  return {
+    agent: "opencode",
+    agentLabel: "OpenCode",
+    sessionId: session.id,
+    filePath,
+    cwd,
+    gitBranch: null,
+    title,
+    firstTimestamp,
+    lastTimestamp: lastTimestamp ?? new Date(session.time_updated).toISOString(),
+    userMessageCount: rendered.userMessageCount,
+    assistantMessageCount: rendered.assistantMessageCount,
+    transcript: rendered.transcript,
+    truncated: rendered.truncated,
+  };
+}
 
 function parseData(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "string") return null;

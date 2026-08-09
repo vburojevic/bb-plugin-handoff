@@ -41,7 +41,15 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
-type WorkspaceMode = "reuse" | "worktree" | "personal";
+type WorkspaceMode = "reuse" | "checkout" | "worktree" | "personal";
+
+interface Machine {
+  id: string;
+  name: string;
+  connected: boolean;
+  isSource: boolean;
+  hasCheckout: boolean;
+}
 
 interface PrepStats {
   title: string;
@@ -71,6 +79,7 @@ interface HandoffRow {
   workspace: WorkspaceMode;
   at: number;
   verification?: "pending" | "confirmed" | "failed";
+  targetMachine?: string | null;
 }
 
 const BRIEFING_TOAST: Record<string, string> = {
@@ -82,6 +91,7 @@ const BRIEFING_TOAST: Record<string, string> = {
 const STAGES = [
   { key: "capturing", label: "Capture" },
   { key: "briefing", label: "Briefing" },
+  { key: "working-state", label: "Working state" },
   { key: "rendering", label: "Render" },
   { key: "uploading", label: "Upload" },
   { key: "spawning", label: "Start thread" },
@@ -89,9 +99,11 @@ const STAGES = [
 
 const WORKSPACE_OPTIONS: {
   value: WorkspaceMode;
-  icon: "FolderOpen" | "Fork" | "Laptop";
+  icon: "FolderOpen" | "Fork" | "Laptop" | "FolderGit";
   label: string;
   description: string;
+  /** Wording when the handoff lands on a different machine. */
+  crossMachine?: { label: string; description: string };
 }[] = [
   {
     value: "reuse",
@@ -100,16 +112,35 @@ const WORKSPACE_OPTIONS: {
     description: "The next agent sees the exact working state, including uncommitted changes.",
   },
   {
+    value: "checkout",
+    icon: "FolderGit",
+    label: "Project checkout",
+    description: "This project's own checkout, not the thread's workspace.",
+    crossMachine: {
+      label: "Project checkout there",
+      description: "This project's checkout on that machine. Uncommitted work travels as a patch.",
+    },
+  },
+  {
     value: "worktree",
     icon: "Fork",
     label: "New worktree",
     description: "An isolated copy of the repo — the original workspace stays untouched.",
+    crossMachine: {
+      label: "New worktree there",
+      description:
+        "A fresh worktree on that machine, based on this thread's branch when it exists there.",
+    },
   },
   {
     value: "personal",
     icon: "Laptop",
     label: "Personal",
     description: "No repo checkout; a blank personal workspace on the same machine.",
+    crossMachine: {
+      label: "Personal",
+      description: "No repo checkout; a blank personal workspace on that machine.",
+    },
   },
 ];
 
@@ -240,6 +271,10 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
   const [modelsLoading, setModelsLoading] = useState(false);
   const [model, setModel] = useState<string>("__default__");
   const [workspace, setWorkspace] = useState<WorkspaceMode>("reuse");
+  const [machines, setMachines] = useState<Machine[]>([]);
+  const [sourceMachineId, setSourceMachineId] = useState<string | null>(null);
+  /** "" means "stay on the source machine". */
+  const [machineId, setMachineId] = useState<string>("");
   const [briefing, setBriefing] = useState(true);
   const [instructions, setInstructions] = useState("");
   const [pending, setPending] = useState(false);
@@ -281,15 +316,10 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
       .then((result) => {
         if (cancelled) return;
         setStats(result);
-        if (!result.hasEnvironment) setWorkspace("worktree");
       })
       .catch((error: unknown) => {
         if (!cancelled) setStatsError(error instanceof Error ? error.message : String(error));
       });
-    rpc
-      .call("listTargets", { threadId })
-      .then((result) => !cancelled && setProviders(result.providers))
-      .catch(() => !cancelled && setProviders([]));
     rpc
       .call("history", null)
       .then((result) => !cancelled && setHistory(result.handoffs))
@@ -299,6 +329,28 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
     };
   }, [rpc, threadId, retryNonce, upToSeq]);
 
+  // Providers are per machine: re-ask whenever the target machine changes, and
+  // drop a selection the new machine cannot run.
+  useEffect(() => {
+    let cancelled = false;
+    setProviders(null);
+    rpc
+      .call("listTargets", { threadId, ...(machineId ? { machineId } : {}) })
+      .then((result) => {
+        if (cancelled) return;
+        setProviders(result.providers);
+        setMachines(result.machines);
+        setSourceMachineId(result.sourceMachineId);
+        setProviderId((current) =>
+          current && !result.providers.some((p) => p.id === current && p.available) ? "" : current,
+        );
+      })
+      .catch(() => !cancelled && setProviders([]));
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc, threadId, retryNonce, machineId]);
+
   useEffect(() => {
     if (!providerId) return;
     let cancelled = false;
@@ -306,14 +358,14 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
     setModel("__default__");
     setModelsLoading(true);
     rpc
-      .call("listModels", { threadId, providerId })
+      .call("listModels", { threadId, providerId, ...(machineId ? { machineId } : {}) })
       .then((result) => !cancelled && setModels(result.models))
       .catch(() => !cancelled && setModels([]))
       .finally(() => !cancelled && setModelsLoading(false));
     return () => {
       cancelled = true;
     };
-  }, [rpc, threadId, providerId]);
+  }, [rpc, threadId, providerId, machineId]);
 
   const selectedProvider = useMemo(
     () => providers?.find((provider) => provider.id === providerId) ?? null,
@@ -350,6 +402,44 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
     [providers, stats],
   );
 
+  const targetMachine = useMemo(
+    () => (machineId ? (machines.find((machine) => machine.id === machineId) ?? null) : null),
+    [machines, machineId],
+  );
+  const sourceMachine = useMemo(
+    () => machines.find((machine) => machine.id === sourceMachineId) ?? null,
+    [machines, sourceMachineId],
+  );
+  const crossMachine = targetMachine != null && targetMachine.id !== sourceMachineId;
+
+  /** Why a workspace mode cannot be used right now, or null when it can. */
+  const workspaceBlocker = useCallback(
+    (mode: WorkspaceMode): string | null => {
+      const machine = targetMachine ?? sourceMachine;
+      if (mode === "reuse") {
+        if (crossMachine) {
+          return `The thread's workspace is on ${sourceMachine?.name ?? "the source machine"}, not ${targetMachine?.name}.`;
+        }
+        return stats && !stats.hasEnvironment ? "This thread has no workspace to share." : null;
+      }
+      if (mode === "checkout" && machine && !machine.hasCheckout) {
+        return `This project has no checkout on ${machine.name}.`;
+      }
+      if (mode === "worktree" && crossMachine && targetMachine && !targetMachine.hasCheckout) {
+        return `No checkout on ${targetMachine.name} to build a worktree from.`;
+      }
+      return null;
+    },
+    [crossMachine, sourceMachine, targetMachine, stats],
+  );
+
+  // Keep the selection valid as the machine (or the thread's environment) changes.
+  useEffect(() => {
+    if (!workspaceBlocker(workspace)) return;
+    const fallback = WORKSPACE_OPTIONS.find((option) => !workspaceBlocker(option.value));
+    if (fallback) setWorkspace(fallback.value);
+  }, [workspace, workspaceBlocker]);
+
   // A scope change (cleared banner) invalidates any cached preview.
   useEffect(() => {
     setPreview(null);
@@ -375,22 +465,43 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
         providerId,
         ...(model !== "__default__" ? { model } : {}),
         workspace,
+        ...(machineId ? { machineId } : {}),
         briefing,
         ...(instructions.trim() ? { extraInstructions: instructions.trim() } : {}),
         ...(upToSeq ? { upToSeq } : {}),
       });
+      const where = result.crossMachine ? ` on ${result.targetMachine}` : "";
       toast.success(
-        `Handed off to ${selectedProvider?.displayName ?? providerId}${BRIEFING_TOAST[result.briefing] ?? ""}`,
+        `Handed off to ${selectedProvider?.displayName ?? providerId}${where}${BRIEFING_TOAST[result.briefing] ?? ""}`,
       );
+      if (result.patchPath) {
+        toast.info(`Uncommitted work carried over as ${result.patchPath}`);
+      }
+      for (const note of result.notes) toast.warning(note);
       navigate.toThread(result.newThreadId);
     } catch (error: unknown) {
       toast.error(error instanceof Error ? error.message : "Handoff failed");
       setPending(false);
       setStage(null);
     }
-  }, [rpc, threadId, providerId, model, workspace, briefing, instructions, upToSeq, navigate, selectedProvider]);
+  }, [
+    rpc,
+    threadId,
+    providerId,
+    model,
+    workspace,
+    machineId,
+    briefing,
+    instructions,
+    upToSeq,
+    navigate,
+    selectedProvider,
+  ]);
 
-  const railStages = briefing ? STAGES : STAGES.filter((step) => step.key !== "briefing");
+  const railStages = STAGES.filter(
+    (step) =>
+      (step.key !== "briefing" || briefing) && (step.key !== "working-state" || crossMachine),
+  );
   const stageIndex = railStages.findIndex((step) => step.key === stage);
 
   return (
@@ -507,6 +618,43 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
               )}
             </div>
 
+            {/* Machine — only meaningful once more than one is enrolled */}
+            {machines.length > 1 ? (
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="handoff-machine">Machine</Label>
+                <Select
+                  value={machineId || "__source__"}
+                  onValueChange={(value) => setMachineId(value === "__source__" ? "" : value)}
+                >
+                  <SelectTrigger id="handoff-machine">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value="__source__">
+                        {sourceMachine ? `${sourceMachine.name} — this thread's machine` : "This thread's machine"}
+                      </SelectItem>
+                      {machines
+                        .filter((machine) => machine.id !== sourceMachineId)
+                        .map((machine) => (
+                          <SelectItem key={machine.id} value={machine.id} disabled={!machine.connected}>
+                            {machine.name}
+                            {machine.connected ? "" : " — disconnected"}
+                          </SelectItem>
+                        ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                {crossMachine ? (
+                  <p className="text-xs leading-snug text-muted-foreground">
+                    The new thread runs on {targetMachine?.name}, working from that machine&apos;s
+                    files. Anything uncommitted here travels with it as a patch the next agent can
+                    apply.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
             {/* Target picker */}
             <div className="flex flex-col gap-2">
               <Label>Continue with</Label>
@@ -519,8 +667,8 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                 </div>
               ) : providers.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
-                  No agents found on this machine. Install a provider CLI (codex, claude, opencode…)
-                  and reload.
+                  No agents found on {targetMachine?.name ?? "this machine"}. Install a provider CLI
+                  (codex, claude, opencode…) there and reload.
                 </p>
               ) : (
                 <div
@@ -618,16 +766,20 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                 className="flex flex-col gap-1.5"
                 onKeyDown={(event) => {
                   const enabled = WORKSPACE_OPTIONS.filter(
-                    (option) => !(option.value === "reuse" && stats && !stats.hasEnvironment),
+                    (option) => !workspaceBlocker(option.value),
                   ).map((option) => option.value);
                   radioKeyNav(event, enabled, workspace, (value) =>
                     setWorkspace(value as WorkspaceMode),
                   );
                 }}
               >
-                {WORKSPACE_OPTIONS.map((option) => {
+                {WORKSPACE_OPTIONS.map((rawOption) => {
+                  const wording =
+                    crossMachine && rawOption.crossMachine ? rawOption.crossMachine : rawOption;
+                  const option = { ...rawOption, ...wording };
                   const selected = workspace === option.value;
-                  const disabled = option.value === "reuse" && stats ? !stats.hasEnvironment : false;
+                  const blocker = workspaceBlocker(option.value);
+                  const disabled = blocker !== null;
                   return (
                     <button
                       key={option.value}
@@ -652,7 +804,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
                         <span className="text-sm font-medium leading-tight">{option.label}</span>
                         <span className="text-xs leading-snug text-muted-foreground">
-                          {disabled ? "This thread has no workspace to share." : option.description}
+                          {blocker ?? option.description}
                         </span>
                       </span>
                       <span
@@ -748,6 +900,11 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                         {providerName(row.targetProvider)}
                         {row.model ? ` · ${row.model}` : ""}
                       </span>
+                      {row.targetMachine ? (
+                        <span className="shrink-0 rounded bg-muted px-1 py-px text-[10px] leading-tight text-muted-foreground">
+                          {row.targetMachine}
+                        </span>
+                      ) : null}
                       {row.verification === "confirmed" ? (
                         <Icon
                           name="CircleCheck"
