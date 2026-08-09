@@ -51,6 +51,18 @@ describe("parseAdoptQuery", () => {
     expect(parseAdoptQuery(`gemini --resume ${UUID}`)).toMatchObject({ agentHint: "gemini" });
   });
 
+  it("recognizes opencode ses_ ids, bare and in commands", () => {
+    expect(parseAdoptQuery("ses_01a059472ffefF56y48oAPfer2")).toEqual({
+      sessionId: "ses_01a059472ffefF56y48oAPfer2",
+      agentHint: "opencode",
+      newest: false,
+    });
+    expect(parseAdoptQuery("opencode --session ses_abc1234")).toMatchObject({
+      sessionId: "ses_abc1234",
+      agentHint: "opencode",
+    });
+  });
+
   it("returns no id for prose and short tokens", () => {
     expect(parseAdoptQuery("hello world")).toEqual({
       sessionId: null,

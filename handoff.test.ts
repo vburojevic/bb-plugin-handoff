@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { startHandoff } from "./handoff";
+import {
+  HISTORY_LIMIT,
+  settleBriefing,
+  settleVerification,
+  startHandoff,
+} from "./handoff";
 
 interface RecordedCall {
   method: string;
@@ -12,7 +17,9 @@ interface RecordedCall {
  * touches (the packed @bb/plugin-sdk testing harness is not distributed with
  * this bb build). Live behavior is covered by the bb plugin dev loop.
  */
-function makeFakeBb() {
+function makeFakeBb(
+  options: { spawnError?: Error; threadStatus?: string; briefingReply?: string } = {},
+) {
   const calls: RecordedCall[] = [];
   const kv = new Map<string, unknown>();
   const record = (method: string, args: unknown) => calls.push({ method, args });
@@ -51,7 +58,15 @@ function makeFakeBb() {
             providerId: "claude-code",
             projectId: "proj_1",
             environmentId: "env_1",
+            status: options.threadStatus ?? "idle",
           };
+        },
+        send: async (args: unknown) => {
+          record("threads.send", args);
+          // The briefing turn "completes" right after the send resolves.
+          queueMicrotask(() =>
+            settleBriefing("thr_src", options.briefingReply ?? "Briefing: step one is done."),
+          );
         },
         events: {
           list: async (args: unknown) => {
@@ -65,6 +80,7 @@ function makeFakeBb() {
         },
         spawn: async (args: unknown) => {
           record("threads.spawn", args);
+          if (options.spawnError) throw options.spawnError;
           return { id: "thr_new" };
         },
       },
@@ -182,5 +198,157 @@ describe("startHandoff", () => {
 
     const spawn = calls.find((call) => call.method === "threads.spawn")!.args as { title: string };
     expect(spawn.title).toBe("Handoff from message: Build feature X");
+  });
+
+  it("tells the next agent how to reach the source thread", async () => {
+    const { bb, calls } = makeFakeBb();
+    await startHandoff(bb, { sourceThreadId: "thr_src", providerId: "codex", workspace: "reuse" });
+    const upload = calls.find((call) => call.method === "attachments.upload")!.args as {
+      clientFile: Uint8Array;
+    };
+    const doc = new TextDecoder().decode(upload.clientFile);
+    expect(doc).toContain('bb thread tell thr_src "<your question>" --mode queue');
+    expect(doc).toContain("bb thread output thr_src");
+  });
+
+  it("with briefing, asks the idle source agent and embeds its answer", async () => {
+    const { bb, calls } = makeFakeBb({ briefingReply: "State: tests green. Next: fix lint." });
+    await startHandoff(bb, {
+      sourceThreadId: "thr_src",
+      providerId: "codex",
+      workspace: "reuse",
+      briefing: true,
+    });
+
+    const send = calls.find((call) => call.method === "threads.send")!.args as {
+      threadId: string;
+      input: { text: string }[];
+    };
+    expect(send.threadId).toBe("thr_src");
+    expect(send.input[0]!.text).toContain("handoff briefing");
+
+    const upload = calls.find((call) => call.method === "attachments.upload")!.args as {
+      clientFile: Uint8Array;
+    };
+    const doc = new TextDecoder().decode(upload.clientFile);
+    expect(doc).toContain("## Briefing from the outgoing agent");
+    expect(doc).toContain("State: tests green. Next: fix lint.");
+    // The briefing exchange itself must not leak into the transcript section.
+    expect(doc.split("## Transcript")[1]).not.toContain("handoff briefing");
+
+    const stages = calls
+      .filter((call) => call.method === "realtime:handoff:progress")
+      .map((call) => (call.args as { stage: string }).stage);
+    expect(stages).toEqual(["capturing", "briefing", "rendering", "uploading", "spawning", "done"]);
+
+    const spawn = calls.find((call) => call.method === "threads.spawn")!.args as {
+      input: { text?: string }[];
+    };
+    expect(spawn.input[0]!.text).toContain("briefing the outgoing agent wrote");
+  });
+
+  it("reports the briefing outcome on the result", async () => {
+    const included = makeFakeBb();
+    const withBriefing = await startHandoff(included.bb, {
+      sourceThreadId: "thr_src",
+      providerId: "codex",
+      workspace: "reuse",
+      briefing: true,
+    });
+    expect(withBriefing.briefing).toBe("included");
+
+    const busy = makeFakeBb({ threadStatus: "active" });
+    const skipped = await startHandoff(busy.bb, {
+      sourceThreadId: "thr_src",
+      providerId: "codex",
+      workspace: "reuse",
+      briefing: true,
+    });
+    expect(skipped.briefing).toBe("skipped-busy");
+
+    const off = makeFakeBb();
+    const without = await startHandoff(off.bb, {
+      sourceThreadId: "thr_src",
+      providerId: "codex",
+      workspace: "reuse",
+    });
+    expect(without.briefing).toBe("off");
+  });
+
+  it("verifies the receiving thread's first turn onto the history record", async () => {
+    const { bb, calls, kv } = makeFakeBb();
+    await startHandoff(bb, { sourceThreadId: "thr_src", providerId: "codex", workspace: "reuse" });
+    const key = [...kv.keys()].find((k) => k.startsWith("handoff:") && k.endsWith(":thr_new"))!;
+    expect((kv.get(key) as { verification?: string }).verification).toBe("pending");
+
+    await settleVerification(bb, "thr_new", true, "Work stands at step two; continuing.");
+    expect((kv.get(key) as { verification?: string }).verification).toBe("confirmed");
+    const verify = calls.find((call) => call.method === "realtime:handoff:verify")!.args as {
+      targetThreadId: string;
+      verification: string;
+    };
+    expect(verify).toMatchObject({ targetThreadId: "thr_new", verification: "confirmed" });
+
+    // Already settled — a later idle for the same thread is a no-op.
+    await settleVerification(bb, "thr_new", false);
+    expect((kv.get(key) as { verification?: string }).verification).toBe("confirmed");
+  });
+
+  it("marks verification failed when the receiving thread fails", async () => {
+    const { bb, kv } = makeFakeBb();
+    await startHandoff(bb, { sourceThreadId: "thr_src", providerId: "codex", workspace: "reuse" });
+    await settleVerification(bb, "thr_new", false);
+    const key = [...kv.keys()].find((k) => k.startsWith("handoff:") && k.endsWith(":thr_new"))!;
+    expect((kv.get(key) as { verification?: string }).verification).toBe("failed");
+  });
+
+  it("skips the briefing when the source thread is busy", async () => {
+    const { bb, calls } = makeFakeBb({ threadStatus: "active" });
+    await startHandoff(bb, {
+      sourceThreadId: "thr_src",
+      providerId: "codex",
+      workspace: "reuse",
+      briefing: true,
+    });
+
+    expect(calls.some((call) => call.method === "threads.send")).toBe(false);
+    const upload = calls.find((call) => call.method === "attachments.upload")!.args as {
+      clientFile: Uint8Array;
+    };
+    const doc = new TextDecoder().decode(upload.clientFile);
+    expect(doc).not.toContain("## Briefing from the outgoing agent");
+  });
+
+  it("publishes a failed stage and rethrows when spawning fails", async () => {
+    const { bb, calls } = makeFakeBb({ spawnError: new Error("provider exploded") });
+    await expect(
+      startHandoff(bb, { sourceThreadId: "thr_src", providerId: "codex", workspace: "reuse" }),
+    ).rejects.toThrow("provider exploded");
+
+    const progress = calls
+      .filter((call) => call.method === "realtime:handoff:progress")
+      .map((call) => call.args as { stage: string; message?: string });
+    expect(progress.map((p) => p.stage)).toEqual([
+      "capturing",
+      "rendering",
+      "uploading",
+      "spawning",
+      "failed",
+    ]);
+    expect(progress.at(-1)!.message).toBe("provider exploded");
+  });
+
+  it("prunes the oldest history records beyond HISTORY_LIMIT", async () => {
+    const { bb, kv } = makeFakeBb();
+    const base = 1_700_000_000_000;
+    for (let i = 0; i < HISTORY_LIMIT; i += 1) {
+      kv.set(`handoff:${base + i}:thr_${i}`, { targetThreadId: `thr_${i}`, at: base + i });
+    }
+    await startHandoff(bb, { sourceThreadId: "thr_src", providerId: "codex", workspace: "reuse" });
+
+    const keys = [...kv.keys()].filter((key) => key.startsWith("handoff:"));
+    expect(keys).toHaveLength(HISTORY_LIMIT);
+    expect(keys).not.toContain(`handoff:${base}:thr_0`);
+    expect(keys.some((key) => key.endsWith(":thr_new"))).toBe(true);
   });
 });

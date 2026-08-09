@@ -1,7 +1,13 @@
 // `bb handoff adopt …` — the CLI surface of the adopt direction: continue an
 // external agent session (Claude Code, Codex, Gemini CLI) as a bb thread.
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { collectSessions, parseAdoptQuery, performAdopt, performAdoptQuery } from "./adopt-core";
+import {
+  collectSessions,
+  parseAdoptQuery,
+  performAdopt,
+  performAdoptQuery,
+  performAdoptRemote,
+} from "./adopt-core";
 
 interface Flags {
   positional: string[];
@@ -51,12 +57,17 @@ function formatAge(ms: number): string {
 
 export const ADOPT_HELP = `bb handoff adopt — continue an external agent session as a bb thread
 
-Supports Claude Code, Codex, and Gemini CLI sessions.
+Supports Claude Code, Codex, Gemini CLI, and OpenCode sessions.
 
 Usage:
   bb handoff adopt <session-id | resume command>
       Paste an id, an id prefix, or a whole resume command like
       "claude --resume <id>" — located across every agent's session store.
+
+  bb handoff adopt <session-id> --machine <host name or id> [--home <path>] [--cwd <path>]
+      Adopt a Claude Code or Codex session that lives on another enrolled
+      machine; the thread runs on that machine in the session's directory.
+      --home overrides the remote home directory when it can't be derived.
 
   bb handoff adopt list [--cwd <path>] [--agent <name>] [--limit <n>] [--json]
       List adoptable sessions for a directory (newest first, all agents).
@@ -65,7 +76,7 @@ Usage:
       Create a bb thread that continues a session. Defaults to the newest
       session for the directory across all agents. Options:
         --cwd <path>             Session working directory (default: invoking cwd)
-        --agent <name>           Only consider one agent: claude | codex | gemini
+        --agent <name>           Only consider one agent: claude | codex | gemini | opencode
         --project <id>           Target bb project (default: match cwd, else create)
         --title <title>          Thread title
         --thread-provider <id>   bb provider for the new thread (default: same
@@ -88,9 +99,9 @@ export const adoptCommandSpecs = [
   {
     name: "adopt",
     summary:
-      "Adopt a session that ran outside bb (Claude Code, Codex, Gemini CLI) as a bb thread; `adopt list` shows what is adoptable",
+      "Adopt a session that ran outside bb (Claude Code, Codex, Gemini CLI, OpenCode) as a bb thread; `adopt list` shows what is adoptable",
     usage:
-      "bb handoff adopt [<session-id | resume command>] [--cwd <path>] [--agent claude|codex|gemini] [--force] [--dry-run] [--json]  |  bb handoff adopt list [--cwd <path>] [--limit <n>]",
+      "bb handoff adopt [<session-id | resume command>] [--cwd <path>] [--agent claude|codex|gemini|opencode] [--machine <host>] [--home <path>] [--force] [--dry-run] [--json]  |  bb handoff adopt list [--cwd <path>] [--limit <n>]",
   },
 ];
 
@@ -123,13 +134,17 @@ export async function runAdoptCli(
     rest = argv;
   }
   const flags = parseArgs(rest);
+  const machine = flags.values.get("machine");
   const cwd = flags.values.get("cwd") ?? ctx.cwd;
-  if (!cwd) {
+  if (!cwd && !machine) {
     return { exitCode: 1, stderr: "No working directory. Pass --cwd <path>." };
   }
 
   if (command === "list") {
-    const collected = collectSessions(cwd, flags.values.get("agent"));
+    if (machine) {
+      return { exitCode: 1, stderr: "`adopt list` is local-only; use --machine with a session id." };
+    }
+    const collected = collectSessions(cwd!, flags.values.get("agent"));
     if ("error" in collected) return { exitCode: 1, stderr: collected.error };
     const limit = Number(flags.values.get("limit") ?? "10");
     const sessions = collected.slice(0, Number.isFinite(limit) ? limit : 10);
@@ -163,14 +178,25 @@ export async function runAdoptCli(
   // resume command — route it through the query engine (global lookup).
   const positionalQuery = flags.positional.join(" ").trim();
   const agentFlag = flags.values.get("agent");
-  const outcome = positionalQuery
-    ? await performAdoptQuery(bb, {
+  if (machine && !positionalQuery) {
+    return { exitCode: 1, stderr: "Remote adoption needs a session id: bb handoff adopt <id> --machine <host>." };
+  }
+  const outcome = machine
+    ? await performAdoptRemote(bb, {
+        machine,
         query: agentFlag ? `${agentFlag} ${positionalQuery}` : positionalQuery,
         cwd: flags.values.get("cwd") ?? null,
-        contextCwd: ctx.cwd ?? null,
+        home: flags.values.get("home") ?? null,
         ...shared,
       })
-    : await performAdopt(bb, { cwd, agent: agentFlag, ...shared });
+    : positionalQuery
+      ? await performAdoptQuery(bb, {
+          query: agentFlag ? `${agentFlag} ${positionalQuery}` : positionalQuery,
+          cwd: flags.values.get("cwd") ?? null,
+          contextCwd: ctx.cwd ?? null,
+          ...shared,
+        })
+      : await performAdopt(bb, { cwd: cwd!, agent: agentFlag, ...shared });
 
   if (!outcome.ok) {
     const matchLines = outcome.matches
@@ -179,7 +205,7 @@ export async function runAdoptCli(
     const hint =
       outcome.code === "already-adopted"
         ? `\nOpen it with: bb thread open ${outcome.existingThreadId}\nPass --force to adopt it again.`
-        : outcome.code === "not-found"
+        : outcome.code === "not-found" && !machine
           ? `\nRun: bb handoff adopt list --cwd ${cwd}`
           : matchLines
             ? `\n${matchLines}`

@@ -163,8 +163,18 @@ export const codexAdapter: AgentAdapter = {
   },
 
   parse(filePath: string, options: { maxChars?: number } = {}): ParsedSession {
+    return parseCodexContent(fs.readFileSync(filePath, "utf8"), filePath, options);
+  },
+};
+
+/** Parse a Codex rollout session from its JSONL content (local or remote read). */
+export function parseCodexContent(
+  raw: string,
+  filePath: string,
+  options: { maxChars?: number } = {},
+): ParsedSession {
+  {
     const maxChars = options.maxChars ?? 150_000;
-    const raw = fs.readFileSync(filePath, "utf8");
     const builder = new BlockBuilder();
     let sessionId = path.basename(filePath, ".jsonl");
     let cwd: string | null = null;
@@ -227,5 +237,5 @@ export const codexAdapter: AgentAdapter = {
       transcript: rendered.transcript,
       truncated: rendered.truncated,
     };
-  },
-};
+  }
+}

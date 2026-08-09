@@ -1,7 +1,7 @@
 // Shared transcript model: agent adapters produce Blocks, this module renders
 // them to markdown with a size budget. Pure logic, no bb API.
 
-export type AgentId = "claude" | "codex" | "gemini";
+export type AgentId = "claude" | "codex" | "gemini" | "opencode";
 
 export interface SessionSummary {
   agent: AgentId;

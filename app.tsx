@@ -70,10 +70,18 @@ interface HandoffRow {
   model: string | null;
   workspace: WorkspaceMode;
   at: number;
+  verification?: "pending" | "confirmed" | "failed";
 }
+
+const BRIEFING_TOAST: Record<string, string> = {
+  included: " — briefing included",
+  "skipped-busy": " — briefing skipped, the source agent was busy",
+  "skipped-unanswered": " — briefing skipped, no answer in time",
+};
 
 const STAGES = [
   { key: "capturing", label: "Capture" },
+  { key: "briefing", label: "Briefing" },
   { key: "rendering", label: "Render" },
   { key: "uploading", label: "Upload" },
   { key: "spawning", label: "Start thread" },
@@ -109,6 +117,33 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Roving radio-group keyboard support: arrow keys move the selection among
+ * the enabled values and keep focus on the newly selected radio.
+ */
+function radioKeyNav(
+  event: React.KeyboardEvent<HTMLElement>,
+  values: string[],
+  current: string | null,
+  select: (value: string) => void,
+) {
+  const delta =
+    event.key === "ArrowRight" || event.key === "ArrowDown"
+      ? 1
+      : event.key === "ArrowLeft" || event.key === "ArrowUp"
+        ? -1
+        : 0;
+  if (delta === 0 || values.length === 0) return;
+  event.preventDefault();
+  const container = event.currentTarget;
+  const index = current ? values.indexOf(current) : -1;
+  const next = values[(index + delta + values.length) % values.length]!;
+  select(next);
+  requestAnimationFrame(() => {
+    container.querySelector<HTMLElement>('[role="radio"][aria-checked="true"]')?.focus();
+  });
 }
 
 function timeAgo(at: number): string {
@@ -202,8 +237,10 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
   const [providers, setProviders] = useState<TargetProvider[] | null>(null);
   const [providerId, setProviderId] = useState<string>("");
   const [models, setModels] = useState<{ model: string; displayName: string }[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
   const [model, setModel] = useState<string>("__default__");
   const [workspace, setWorkspace] = useState<WorkspaceMode>("reuse");
+  const [briefing, setBriefing] = useState(true);
   const [instructions, setInstructions] = useState("");
   const [pending, setPending] = useState(false);
   const [stage, setStage] = useState<string | null>(null);
@@ -212,9 +249,27 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
   const [preview, setPreview] = useState<{ doc: string; docBytes: number; truncated: boolean } | null>(null);
   const [previewError, setPreviewError] = useState(false);
 
+  useRealtime("handoff:verify", (payload) => {
+    const data = payload as { targetThreadId?: string; verification?: string };
+    if (!data.targetThreadId || (data.verification !== "confirmed" && data.verification !== "failed")) {
+      return;
+    }
+    setHistory((rows) =>
+      rows.map((row) =>
+        row.targetThreadId === data.targetThreadId
+          ? { ...row, verification: data.verification as "confirmed" | "failed" }
+          : row,
+      ),
+    );
+  });
+
   useRealtime("handoff:progress", (payload) => {
     const data = payload as { sourceThreadId?: string; stage?: string };
-    if (data.sourceThreadId === threadId && data.stage) setStage(data.stage);
+    if (data.sourceThreadId !== threadId || !data.stage) return;
+    // "failed" and unknown stages are ignored: the rpc rejection resets the UI.
+    if (data.stage === "done" || STAGES.some((step) => step.key === data.stage)) {
+      setStage(data.stage);
+    }
   });
 
   useEffect(() => {
@@ -237,7 +292,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
       .catch(() => !cancelled && setProviders([]));
     rpc
       .call("history", null)
-      .then((result) => !cancelled && setHistory(result.handoffs.slice(0, 8)))
+      .then((result) => !cancelled && setHistory(result.handoffs))
       .catch(() => {});
     return () => {
       cancelled = true;
@@ -249,10 +304,12 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
     let cancelled = false;
     setModels([]);
     setModel("__default__");
+    setModelsLoading(true);
     rpc
       .call("listModels", { threadId, providerId })
       .then((result) => !cancelled && setModels(result.models))
-      .catch(() => !cancelled && setModels([]));
+      .catch(() => !cancelled && setModels([]))
+      .finally(() => !cancelled && setModelsLoading(false));
     return () => {
       cancelled = true;
     };
@@ -262,6 +319,28 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
     () => providers?.find((provider) => provider.id === providerId) ?? null,
     [providers, providerId],
   );
+  // Available targets first; unavailable ones sink to the end but stay visible.
+  const sortedProviders = useMemo(
+    () =>
+      providers === null
+        ? null
+        : [...providers].sort((a, b) => Number(b.available) - Number(a.available)),
+    [providers],
+  );
+  const selectableProviderIds = useMemo(
+    () => (sortedProviders ?? []).filter((provider) => provider.available).map((provider) => provider.id),
+    [sortedProviders],
+  );
+  // Handoffs involving this thread when any exist, recent global ones otherwise.
+  const historyView = useMemo(() => {
+    const scoped = history.filter(
+      (row) => row.sourceThreadId === threadId || row.targetThreadId === threadId,
+    );
+    return {
+      rows: (scoped.length > 0 ? scoped : history).slice(0, 8),
+      scopedToThread: scoped.length > 0,
+    };
+  }, [history, threadId]);
   const providerName = useCallback(
     (id: string) => providers?.find((provider) => provider.id === id)?.displayName ?? id,
     [providers],
@@ -296,19 +375,23 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
         providerId,
         ...(model !== "__default__" ? { model } : {}),
         workspace,
+        briefing,
         ...(instructions.trim() ? { extraInstructions: instructions.trim() } : {}),
         ...(upToSeq ? { upToSeq } : {}),
       });
-      toast.success(`Handed off to ${selectedProvider?.displayName ?? providerId}`);
+      toast.success(
+        `Handed off to ${selectedProvider?.displayName ?? providerId}${BRIEFING_TOAST[result.briefing] ?? ""}`,
+      );
       navigate.toThread(result.newThreadId);
     } catch (error: unknown) {
       toast.error(error instanceof Error ? error.message : "Handoff failed");
       setPending(false);
       setStage(null);
     }
-  }, [rpc, threadId, providerId, model, workspace, instructions, upToSeq, navigate, selectedProvider]);
+  }, [rpc, threadId, providerId, model, workspace, briefing, instructions, upToSeq, navigate, selectedProvider]);
 
-  const stageIndex = STAGES.findIndex((step) => step.key === stage);
+  const railStages = briefing ? STAGES : STAGES.filter((step) => step.key !== "briefing");
+  const stageIndex = railStages.findIndex((step) => step.key === stage);
 
   return (
     <TooltipProvider delayDuration={200}>
@@ -440,8 +523,15 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                   and reload.
                 </p>
               ) : (
-                <div role="radiogroup" aria-label="Target agent" className="grid grid-cols-2 gap-2">
-                  {providers.map((provider) => {
+                <div
+                  role="radiogroup"
+                  aria-label="Target agent"
+                  className="grid grid-cols-2 gap-2"
+                  onKeyDown={(event) =>
+                    radioKeyNav(event, selectableProviderIds, providerId || null, setProviderId)
+                  }
+                >
+                  {(sortedProviders ?? []).map((provider) => {
                     const selected = provider.id === providerId;
                     const isCurrent = provider.id === stats?.providerId;
                     return (
@@ -450,6 +540,11 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                         type="button"
                         role="radio"
                         aria-checked={selected}
+                        tabIndex={
+                          selected || (!providerId && provider.id === selectableProviderIds[0])
+                            ? 0
+                            : -1
+                        }
                         disabled={!provider.available}
                         onClick={() => setProviderId(provider.id)}
                         className={cn(
@@ -488,7 +583,12 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
             </div>
 
             {/* Model */}
-            {models.length > 0 ? (
+            {providerId && modelsLoading ? (
+              <div className="flex flex-col gap-2">
+                <Label>Model</Label>
+                <Skeleton className="h-9 w-full" />
+              </div>
+            ) : models.length > 0 ? (
               <div className="flex flex-col gap-2 animate-in fade-in-0 duration-200">
                 <Label htmlFor="handoff-model">Model</Label>
                 <Select value={model} onValueChange={setModel}>
@@ -512,7 +612,19 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
             {/* Workspace */}
             <div className="flex flex-col gap-2">
               <Label>Workspace</Label>
-              <div role="radiogroup" aria-label="Workspace" className="flex flex-col gap-1.5">
+              <div
+                role="radiogroup"
+                aria-label="Workspace"
+                className="flex flex-col gap-1.5"
+                onKeyDown={(event) => {
+                  const enabled = WORKSPACE_OPTIONS.filter(
+                    (option) => !(option.value === "reuse" && stats && !stats.hasEnvironment),
+                  ).map((option) => option.value);
+                  radioKeyNav(event, enabled, workspace, (value) =>
+                    setWorkspace(value as WorkspaceMode),
+                  );
+                }}
+              >
                 {WORKSPACE_OPTIONS.map((option) => {
                   const selected = workspace === option.value;
                   const disabled = option.value === "reuse" && stats ? !stats.hasEnvironment : false;
@@ -522,6 +634,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                       type="button"
                       role="radio"
                       aria-checked={selected}
+                      tabIndex={selected ? 0 : -1}
                       disabled={disabled}
                       onClick={() => setWorkspace(option.value)}
                       className={cn(
@@ -557,6 +670,46 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
               </div>
             </div>
 
+            {/* Briefing */}
+            <button
+              type="button"
+              role="checkbox"
+              aria-checked={briefing}
+              onClick={() => setBriefing((value) => !value)}
+              className={cn(
+                "flex items-start gap-2.5 rounded-lg border p-2.5 text-left transition-colors",
+                "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                briefing ? "border-primary/50 bg-primary/5" : "border-border hover:bg-accent/50",
+              )}
+            >
+              <Icon
+                name="BubbleChatQuestion"
+                className="mt-0.5 size-4 shrink-0 text-muted-foreground"
+                aria-hidden
+              />
+              <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <span className="text-sm font-medium leading-tight">
+                  Ask {sourceProvider?.displayName ?? "the current agent"} for a briefing
+                </span>
+                <span className="text-xs leading-snug text-muted-foreground">
+                  Before the transfer, the outgoing agent writes a short status note — current
+                  state, decisions, gotchas — that travels with the handoff. Skipped automatically
+                  if it&apos;s busy; adds up to ~90s.
+                </span>
+              </span>
+              <span
+                aria-hidden
+                className={cn(
+                  "mt-1 flex size-3.5 shrink-0 items-center justify-center rounded-[4px] border",
+                  briefing
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-muted-foreground/40",
+                )}
+              >
+                {briefing ? <Icon name="Check" className="size-2.5" aria-hidden /> : null}
+              </span>
+            </button>
+
             {/* Notes */}
             <div className="flex flex-col gap-2">
               <Label htmlFor="handoff-notes">Note for the next agent</Label>
@@ -571,14 +724,17 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
             </div>
 
             {/* History */}
-            {history.length > 0 ? (
+            {historyView.rows.length > 0 ? (
               <div className="flex flex-col gap-1">
                 <Separator className="mb-3" />
-                <p className="mb-1 text-sm font-medium">Previous handoffs</p>
-                {history.map((row) => (
+                <p className="mb-1 text-sm font-medium">
+                  {historyView.scopedToThread ? "Handoffs of this thread" : "Recent handoffs"}
+                </p>
+                {historyView.rows.map((row) => (
                   <button
                     key={`${row.at}-${row.targetThreadId}`}
                     type="button"
+                    title={new Date(row.at).toLocaleString()}
                     onClick={() => navigate.toThread(row.targetThreadId)}
                     className="group -mx-2 flex items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                   >
@@ -592,6 +748,19 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                         {providerName(row.targetProvider)}
                         {row.model ? ` · ${row.model}` : ""}
                       </span>
+                      {row.verification === "confirmed" ? (
+                        <Icon
+                          name="CircleCheck"
+                          className="size-3 shrink-0 text-primary"
+                          aria-label="The receiving agent confirmed the pickup"
+                        />
+                      ) : row.verification === "failed" ? (
+                        <Icon
+                          name="AlertTriangle"
+                          className="size-3 shrink-0 text-destructive"
+                          aria-label="The receiving thread may not have picked up the context"
+                        />
+                      ) : null}
                     </span>
                     <Icon
                       name="ExternalLink"
@@ -610,7 +779,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
           {pending ? (
             <div className="flex items-center justify-between gap-3" aria-live="polite">
               <div className="flex items-center gap-3">
-                {STAGES.map((step, index) => {
+                {railStages.map((step, index) => {
                   const done = stage === "done" || index < stageIndex;
                   const active = index === stageIndex && stage !== "done";
                   return (
@@ -633,6 +802,9 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                   );
                 })}
               </div>
+              <span className="min-w-0 truncate text-xs text-muted-foreground">
+                → {selectedProvider?.displayName ?? providerId}
+              </span>
             </div>
           ) : (
             <div className="flex items-center justify-between gap-3">
@@ -673,6 +845,29 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                 </div>
               )}
             </div>
+            {preview && !previewError ? (
+              <div className="flex justify-end">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    navigator.clipboard
+                      .writeText(preview.doc)
+                      .then(() =>
+                        toast.success(
+                          preview.truncated
+                            ? "Copied the shortened preview"
+                            : "Copied the handoff markdown",
+                        ),
+                      )
+                      .catch(() => toast.error("Couldn't copy to the clipboard"));
+                  }}
+                >
+                  <Icon name="Copy" aria-hidden />
+                  Copy markdown
+                </Button>
+              </div>
+            ) : null}
           </DialogContent>
         </Dialog>
       </div>

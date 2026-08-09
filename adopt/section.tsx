@@ -33,6 +33,7 @@ const AGENT_LABELS: Record<string, string> = {
   claude: "Claude",
   codex: "Codex",
   gemini: "Gemini",
+  opencode: "OpenCode",
 };
 
 const VISIBLE_SESSIONS = 5;
@@ -108,6 +109,7 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
   const [open, setOpen] = useState(false);
 
   // Primary paste flow
+  const queryInputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
   const [inlineError, setInlineError] = useState<string | null>(null);
   const [matches, setMatches] = useState<SessionRow[] | null>(null);
@@ -180,6 +182,7 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
     ) => {
       if (result.ok && result.threadId) {
         toast.success("Session adopted — the thread is picking up the context.");
+        setQuery("");
         navigate.toThread(result.threadId);
         return;
       }
@@ -241,7 +244,13 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
   const hiddenCount = Math.max(0, (sessions?.length ?? 0) - VISIBLE_SESSIONS);
 
   return (
-    <Collapsible open={open} onOpenChange={setOpen}>
+    <Collapsible
+      open={open}
+      onOpenChange={(value) => {
+        setOpen(value);
+        if (value) requestAnimationFrame(() => queryInputRef.current?.focus());
+      }}
+    >
       <CollapsibleTrigger asChild>
         <Button
           variant="ghost"
@@ -250,7 +259,7 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
         >
           <Icon name="Download" aria-hidden />
           <span className="min-w-0 flex-1 truncate text-left">
-            Continue a session from another agent — Claude Code, Codex, Gemini CLI…
+            Continue a session from another agent — Claude Code, Codex, Gemini CLI, OpenCode…
           </span>
           <Icon name={open ? "ChevronUp" : "ChevronDown"} aria-hidden />
         </Button>
@@ -261,6 +270,7 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
             {/* Paste an id or resume command */}
             <div className="flex flex-col gap-2 sm:flex-row">
               <Input
+                ref={queryInputRef}
                 value={query}
                 onChange={(event) => {
                   setQuery(event.target.value);

@@ -37,9 +37,15 @@ context awareness.
 | Claude Code | `~/.claude/projects/<cwd-slug>/*.jsonl`        | `claude-code`                         |
 | Codex CLI   | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `codex`                               |
 | Gemini CLI  | `~/.gemini/tmp/<sha256(cwd)>/chats/*.json`     | `claude-code` (no bb Gemini provider) |
+| OpenCode    | `~/.local/share/opencode/opencode.db` (SQLite) | `acp-opencode`                        |
 
 - Finds session files for a working directory across all supported agents and
   picks the newest (or the one you name), or locates a pasted id globally.
+- `--machine <host>` adopts a Claude Code or Codex session from another
+  enrolled machine (read via bb's file API; the thread runs on that host).
+- A session with activity in the last ~10 minutes gets a "may still be
+  running" warning in the handoff document so the agent watches for
+  concurrent edits.
 - Converts the transcript (user + assistant messages, tool-call summaries)
   into a handoff document.
 - Spawns a bb thread **in the same directory**, so files are exactly where the
@@ -82,12 +88,15 @@ bb handoff --self --to codex                 # hand off the current thread
 bb handoff <thread-id> --to acp-opencode \
   --model <model> --workspace worktree \
   --instructions "Finish the tests first"
+bb handoff <thread-id> --to codex --briefing # ask the (idle) source agent for a
+                                             # handoff note first; embedded in the doc
 bb handoff <thread-id> --dry-run             # capture stats only
 bb handoff <thread-id> --to codex --up-to-seq <n>   # only context up to a message's sourceSeqEnd
 bb handoff export --self --out handoff.md    # for use outside bb:
 codex exec - < handoff.md                    #   e.g. pipe into codex
-bb handoff targets                           # list available providers
-bb handoff list                              # past handoffs
+bb handoff targets [--json]                  # list available providers
+bb handoff list [--json]                     # past handoffs (kept to the last 100)
+bb handoff help                              # usage overview
 
 # Adopt — run from inside a live terminal session, or paste an id
 bb handoff adopt                             # newest session for this directory

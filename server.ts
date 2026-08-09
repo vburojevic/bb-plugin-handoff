@@ -10,7 +10,14 @@ import { z } from "zod";
 import { adoptCommandSpecs, runAdoptCli } from "./adopt/cli";
 import { adoptRpcShape, createAdoptRpcHandlers } from "./adopt/rpc";
 import { captureThread } from "./capture";
-import { listHandoffs, renderHandoff, startHandoff, type WorkspaceMode } from "./handoff";
+import {
+  listHandoffs,
+  renderHandoff,
+  settleBriefing,
+  settleVerification,
+  startHandoff,
+  type WorkspaceMode,
+} from "./handoff";
 
 const workspaceModeSchema = z.enum(["reuse", "worktree", "personal"]);
 
@@ -69,9 +76,14 @@ export const rpcContract = defineRpcContract({
         workspace: workspaceModeSchema,
         extraInstructions: z.string().optional(),
         upToSeq: upToSeqField,
+        briefing: z.boolean().optional(),
       })
       .strict(),
-    output: z.object({ newThreadId: z.string(), docBytes: z.number() }),
+    output: z.object({
+      newThreadId: z.string(),
+      docBytes: z.number(),
+      briefing: z.enum(["included", "skipped-busy", "skipped-unanswered", "off"]),
+    }),
   },
   history: {
     input: z.null(),
@@ -85,6 +97,7 @@ export const rpcContract = defineRpcContract({
           model: z.string().nullable(),
           workspace: workspaceModeSchema,
           at: z.number(),
+          verification: z.enum(["pending", "confirmed", "failed"]).optional(),
         }),
       ),
     }),
@@ -98,6 +111,21 @@ async function environmentIdOfThread(bb: BbPluginApi, threadId: string): Promise
 }
 
 export default async function plugin(bb: BbPluginApi) {
+  // Settle any handoff waiting on its source thread's briefing turn, and
+  // verify fresh handoff targets when their first turn finishes.
+  bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
+    settleBriefing(thread.id, lastAssistantText);
+    void settleVerification(bb, thread.id, true, lastAssistantText).catch((error) => {
+      bb.log.warn(`verification settle failed: ${error instanceof Error ? error.message : error}`);
+    });
+  });
+  bb.events.on("thread.failed", ({ thread }) => {
+    settleBriefing(thread.id, null);
+    void settleVerification(bb, thread.id, false).catch((error) => {
+      bb.log.warn(`verification settle failed: ${error instanceof Error ? error.message : error}`);
+    });
+  });
+
   bb.rpc.register(rpcContract, {
     ...createAdoptRpcHandlers(bb),
     async prepareHandoff({ threadId, upToSeq }) {
@@ -153,7 +181,7 @@ export default async function plugin(bb: BbPluginApi) {
         })),
       };
     },
-    async startHandoff({ threadId, providerId, model, workspace, extraInstructions, upToSeq }) {
+    async startHandoff({ threadId, providerId, model, workspace, extraInstructions, upToSeq, briefing }) {
       const result = await startHandoff(bb, {
         sourceThreadId: threadId,
         providerId,
@@ -161,9 +189,10 @@ export default async function plugin(bb: BbPluginApi) {
         workspace,
         extraInstructions,
         untilSeq: upToSeq,
+        briefing,
       });
       bb.log.info(`handoff ${threadId} → ${providerId} (${result.newThreadId})`);
-      return { newThreadId: result.newThreadId, docBytes: result.docBytes };
+      return { newThreadId: result.newThreadId, docBytes: result.docBytes, briefing: result.briefing };
     },
     async history() {
       return { handoffs: await listHandoffs(bb) };
@@ -179,7 +208,7 @@ export default async function plugin(bb: BbPluginApi) {
         name: "start",
         summary: "Capture a thread and spawn a new thread on another provider seeded with it",
         usage:
-          "bb handoff <thread-id|--self> --to <provider> [--model <model>] [--workspace reuse|worktree|personal] [--instructions <text>] [--up-to-seq <n>] [--dry-run]",
+          "bb handoff <thread-id|--self> --to <provider> [--model <model>] [--workspace reuse|worktree|personal] [--instructions <text>] [--up-to-seq <n>] [--briefing] [--dry-run]",
       },
       {
         name: "export",
@@ -189,9 +218,9 @@ export default async function plugin(bb: BbPluginApi) {
       {
         name: "targets",
         summary: "List target providers available for a thread's host",
-        usage: "bb handoff targets [--thread <thread-id>]",
+        usage: "bb handoff targets [--thread <thread-id>] [--json]",
       },
-      { name: "list", summary: "Show past handoffs", usage: "bb handoff list" },
+      { name: "list", summary: "Show past handoffs", usage: "bb handoff list [--json]" },
     ],
     async run(argv, ctx) {
       // The adopt direction owns its own argv grammar (ids, resume commands,
@@ -200,11 +229,12 @@ export default async function plugin(bb: BbPluginApi) {
         return runAdoptCli(bb, argv.slice(1), { cwd: ctx.cwd, threadId: ctx.threadId });
       }
       const fail = (message: string) => ({ exitCode: 1, stderr: `${message}\n` });
+      const BOOLEAN_FLAGS = new Set(["--self", "--dry-run", "--json", "--help", "--briefing"]);
       const flags = new Map<string, string>();
       const positional: string[] = [];
       for (let i = 0; i < argv.length; i++) {
         const arg = argv[i]!;
-        if (arg === "--self" || arg === "--dry-run") flags.set(arg, "true");
+        if (BOOLEAN_FLAGS.has(arg)) flags.set(arg, "true");
         else if (arg.startsWith("--")) flags.set(arg, argv[++i] ?? "");
         else positional.push(arg);
       }
@@ -216,8 +246,26 @@ export default async function plugin(bb: BbPluginApi) {
 
       const command = positional[0] && !positional[0].startsWith("thr_") ? positional.shift()! : "start";
 
+      if (command === "help" || flags.has("--help")) {
+        const help = [
+          "bb handoff — move a session between agents, in both directions",
+          "",
+          "  bb handoff <thread-id|--self> --to <provider> [--model <m>] [--workspace reuse|worktree|personal]",
+          "             [--instructions <text>] [--up-to-seq <n>] [--briefing] [--dry-run]",
+          "             --briefing asks the (idle) source agent for a handoff note first",
+          "  bb handoff export <thread-id|--self> [--out <path>]",
+          "  bb handoff targets [--thread <thread-id>] [--json]",
+          "  bb handoff list [--json]",
+          "  bb handoff adopt …   (see `bb handoff adopt help`)",
+        ].join("\n");
+        return { exitCode: 0, stdout: `${help}\n` };
+      }
+
       if (command === "list") {
         const handoffs = await listHandoffs(bb);
+        if (flags.has("--json")) {
+          return { exitCode: 0, stdout: `${JSON.stringify({ handoffs }, null, 2)}\n` };
+        }
         if (handoffs.length === 0) return { exitCode: 0, stdout: "No handoffs recorded yet.\n" };
         const lines = handoffs.map(
           (record) =>
@@ -230,6 +278,14 @@ export default async function plugin(bb: BbPluginApi) {
         const threadId = flags.get("--thread") ?? ctx.threadId;
         const environmentId = threadId ? await environmentIdOfThread(bb, threadId) : null;
         const providers = await bb.sdk.providers.list(environmentId ? { environmentId } : undefined);
+        if (flags.has("--json")) {
+          const payload = providers.map((provider) => ({
+            id: provider.id,
+            displayName: provider.displayName,
+            available: provider.available,
+          }));
+          return { exitCode: 0, stdout: `${JSON.stringify({ providers: payload }, null, 2)}\n` };
+        }
         const lines = providers.map(
           (provider) => `${provider.id}\t${provider.displayName}${provider.available ? "" : "\t(unavailable)"}`,
         );
@@ -292,6 +348,7 @@ export default async function plugin(bb: BbPluginApi) {
           workspace,
           extraInstructions: flags.get("--instructions"),
           untilSeq: upToSeq,
+          briefing: flags.has("--briefing"),
         });
         return {
           exitCode: 0,

@@ -2,8 +2,14 @@ import type { AgentAdapter, AgentId } from "../transcript";
 import { claudeAdapter } from "./claude";
 import { codexAdapter } from "./codex";
 import { geminiAdapter } from "./gemini";
+import { opencodeAdapter } from "./opencode";
 
-export const ADAPTERS: readonly AgentAdapter[] = [claudeAdapter, codexAdapter, geminiAdapter];
+export const ADAPTERS: readonly AgentAdapter[] = [
+  claudeAdapter,
+  codexAdapter,
+  geminiAdapter,
+  opencodeAdapter,
+];
 
 const ALIASES: Record<string, AgentId> = {
   claude: "claude",
@@ -11,6 +17,8 @@ const ALIASES: Record<string, AgentId> = {
   codex: "codex",
   gemini: "gemini",
   "gemini-cli": "gemini",
+  opencode: "opencode",
+  "acp-opencode": "opencode",
 };
 
 export function resolveAgentId(value: string): AgentId | null {
