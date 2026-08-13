@@ -82,18 +82,80 @@ export interface TransferInputs {
   machine?: string | null;
 }
 
+/**
+ * Resolve `work` but give up after `ms`.
+ *
+ * Anything routed at an explicit `hostId` can reach another machine, and a
+ * machine that is asleep or off the network does not fail fast — it just
+ * never answers. Inside an rpc handler that stalls bb's shared event loop for
+ * as long as the call takes, so every remote lookup here is bounded and
+ * degrades to "unknown" instead.
+ */
+async function withTimeout<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+      }),
+    ]);
+  } catch {
+    return fallback;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** Remote lookups in a handler get this long before they are written off. */
+export const REMOTE_LOOKUP_TIMEOUT_MS = 3_000;
+
+/** The sources a checkout lookup needs, without refetching the project list. */
+export interface ProjectSourceLike {
+  hostId: string | null;
+  path: string | null;
+  isDefault?: boolean;
+}
+
+/** The project's checkout on one host, preferring the default source. */
+export function sourcePathOnHostFrom(
+  sources: readonly ProjectSourceLike[],
+  hostId: string,
+): string | null {
+  const onHost = sources.filter((source) => source.hostId === hostId);
+  const chosen = onHost.find((source) => source.isDefault) ?? onHost[0];
+  return chosen?.path ?? null;
+}
+
 /** The project's checkout on one host, preferring the default source. */
 export async function sourcePathOnHost(
   bb: BbPluginApi,
   projectId: string,
   hostId: string,
 ): Promise<string | null> {
+  const sources = await projectSources(bb, projectId);
+  return sourcePathOnHostFrom(sources, hostId);
+}
+
+/** One project-list fetch, reusable across every machine in a request. */
+export async function projectSources(
+  bb: BbPluginApi,
+  projectId: string,
+): Promise<readonly ProjectSourceLike[]> {
   const projects = await bb.sdk.projects.list({ includePersonal: true }).catch(() => []);
-  const project = projects.find((candidate) => candidate.id === projectId);
-  if (!project) return null;
-  const onHost = project.sources.filter((source) => source.hostId === hostId);
-  const chosen = onHost.find((source) => source.isDefault) ?? onHost[0];
-  return chosen?.path ?? null;
+  return projects.find((candidate) => candidate.id === projectId)?.sources ?? [];
+}
+
+/** Provider discovery, bounded — an unreachable host yields no providers. */
+export async function listProvidersBounded(
+  bb: BbPluginApi,
+  args: { hostId: string } | { environmentId: string } | undefined,
+): Promise<Awaited<ReturnType<BbPluginApi["sdk"]["providers"]["list"]>>> {
+  return withTimeout(
+    bb.sdk.providers.list(args).catch(() => []),
+    REMOTE_LOOKUP_TIMEOUT_MS,
+    [],
+  );
 }
 
 async function hostHasBranch(
@@ -102,17 +164,16 @@ async function hostHasBranch(
   hostId: string,
   branch: string,
 ): Promise<boolean> {
-  try {
-    const result = await bb.sdk.projects.branches({
-      projectId,
-      hostId,
-      query: branch,
-      limit: "100",
-    });
-    return result.branches.includes(branch);
-  } catch {
-    return false;
-  }
+  // Listing branches runs git on `hostId`, which may be another machine.
+  const result = await withTimeout(
+    bb.sdk.projects
+      .branches({ projectId, hostId, query: branch, limit: "100" })
+      .then((response) => response.branches.includes(branch))
+      .catch(() => false),
+    REMOTE_LOOKUP_TIMEOUT_MS,
+    false,
+  );
+  return result;
 }
 
 /**

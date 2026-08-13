@@ -24,7 +24,10 @@ import {
   listMachines,
   matchMachine,
   planTransfer,
+  listProvidersBounded,
+  projectSources,
   sourcePathOnHost,
+  sourcePathOnHostFrom,
   type TransferPlan,
 } from "./machines";
 
@@ -198,13 +201,19 @@ export default async function plugin(bb: BbPluginApi) {
       // Providers are discovered per machine: the target's CLIs decide what
       // this handoff can actually land on, not the source's.
       const environmentId = target ? null : await environmentIdOfThread(bb, threadId);
-      const providers = await bb.sdk.providers.list(
+      // Discovering a target machine's provider CLIs is a round trip to that
+      // machine. Unbounded, one sleeping laptop held this handler — and bb's
+      // event loop with it — for seconds; an empty list just means "we could
+      // not ask", which the picker already renders as nothing available.
+      const providers = await listProvidersBounded(
+        bb,
         target ? { hostId: target.id } : environmentId ? { environmentId } : undefined,
       );
-      const checkouts = await Promise.all(
-        machines.map(async (machine) =>
-          projectId ? Boolean(await sourcePathOnHost(bb, projectId, machine.id)) : false,
-        ),
+      // One project fetch for every machine, not one per machine: this is a
+      // pure filter over the project's sources once we have them.
+      const sources = projectId === null ? [] : await projectSources(bb, projectId);
+      const checkouts = machines.map((machine) =>
+        sourcePathOnHostFrom(sources, machine.id) !== null,
       );
       return {
         providers: providers.map((provider) => ({
