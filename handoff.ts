@@ -16,10 +16,29 @@ import {
 export { TransferError } from "./machines";
 export type { TransferPlan, WorkingState, WorkspaceMode } from "./machines";
 
+/**
+ * Thinking effort for the target thread. Mirrors bb's `ReasoningLevel`, which
+ * the SDK declares but does not export.
+ */
+export type ReasoningLevel =
+  | "none"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "ultracode"
+  | "max"
+  | "ultra";
+
 export interface HandoffRequest {
   sourceThreadId: string;
   providerId: string;
   model?: string;
+  /**
+   * Thinking effort for the new thread. Omit to let the target model use its
+   * own default — bb re-derives it, so omitting is not the same as "none".
+   */
+  reasoningLevel?: ReasoningLevel;
   workspace: WorkspaceMode;
   /**
    * Machine (host id or name) to run the new thread on. Omit to stay on the
@@ -50,6 +69,7 @@ export interface HandoffRecord {
   targetThreadId: string;
   targetProvider: string;
   model: string | null;
+  reasoningLevel?: ReasoningLevel | null;
   workspace: WorkspaceMode;
   at: number;
   verification?: VerificationState;
@@ -552,6 +572,7 @@ async function runHandoff(
     projectId: captured.projectId,
     providerId: request.providerId,
     ...(request.model ? { model: request.model } : {}),
+    ...(request.reasoningLevel ? { reasoningLevel: request.reasoningLevel } : {}),
     environment,
     title: `${captured.untilSeq != null ? "Handoff from message" : "Handoff"}: ${captured.title}`,
     input: [
@@ -576,6 +597,7 @@ async function runHandoff(
     targetThreadId: thread.id,
     targetProvider: request.providerId,
     model: request.model ?? null,
+    reasoningLevel: request.reasoningLevel ?? null,
     workspace: request.workspace,
     at: Date.now(),
     verification: "pending",

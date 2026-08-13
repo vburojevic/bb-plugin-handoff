@@ -33,6 +33,24 @@ import {
 
 const workspaceModeSchema = z.enum(["reuse", "checkout", "worktree", "personal"]);
 
+/**
+ * Thinking effort for the target thread. Mirrors bb's `ReasoningLevel`, which
+ * the SDK declares but does not export. Never offer these blind: the levels a
+ * model actually accepts differ per model, and `providers.models()` reports
+ * them, so the picker is driven by `supportedReasoningEfforts` rather than by
+ * this full set.
+ */
+const reasoningLevelSchema = z.enum([
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "ultracode",
+  "max",
+  "ultra",
+]);
+
 /** Event-seq cutoff of one chat message; scopes the capture to everything up to it. */
 const upToSeqField = z.number().int().positive().optional();
 
@@ -90,7 +108,18 @@ export const rpcContract = defineRpcContract({
       .object({ threadId: z.string(), providerId: z.string(), machineId: z.string().optional() })
       .strict(),
     output: z.object({
-      models: z.array(z.object({ model: z.string(), displayName: z.string() })),
+      models: z.array(
+        z.object({
+          model: z.string(),
+          displayName: z.string(),
+          /** The model the provider picks when the handoff names none. */
+          isDefault: z.boolean(),
+          defaultReasoningEffort: reasoningLevelSchema,
+          supportedReasoningEfforts: z.array(
+            z.object({ reasoningEffort: reasoningLevelSchema, description: z.string() }),
+          ),
+        }),
+      ),
     }),
   },
   startHandoff: {
@@ -104,6 +133,7 @@ export const rpcContract = defineRpcContract({
         extraInstructions: z.string().optional(),
         upToSeq: upToSeqField,
         briefing: z.boolean().optional(),
+        reasoningLevel: reasoningLevelSchema.optional(),
       })
       .strict(),
     output: z.object({
@@ -126,6 +156,7 @@ export const rpcContract = defineRpcContract({
           targetThreadId: z.string(),
           targetProvider: z.string(),
           model: z.string().nullable(),
+          reasoningLevel: reasoningLevelSchema.nullable().optional(),
           workspace: workspaceModeSchema,
           at: z.number(),
           verification: z.enum(["pending", "confirmed", "failed"]).optional(),
@@ -259,6 +290,12 @@ export default async function plugin(bb: BbPluginApi) {
         models: options.models.map((model) => ({
           model: model.model,
           displayName: model.displayName,
+          isDefault: model.isDefault,
+          defaultReasoningEffort: model.defaultReasoningEffort,
+          supportedReasoningEfforts: model.supportedReasoningEfforts.map((effort) => ({
+            reasoningEffort: effort.reasoningEffort,
+            description: effort.description,
+          })),
         })),
       };
     },
@@ -271,6 +308,7 @@ export default async function plugin(bb: BbPluginApi) {
       extraInstructions,
       upToSeq,
       briefing,
+      reasoningLevel,
     }) {
       const result = await startHandoff(bb, {
         sourceThreadId: threadId,
@@ -281,6 +319,7 @@ export default async function plugin(bb: BbPluginApi) {
         extraInstructions,
         untilSeq: upToSeq,
         briefing,
+        reasoningLevel,
       });
       const where = result.crossMachine ? ` on ${result.targetMachine}` : "";
       bb.log.info(`handoff ${threadId} → ${providerId}${where} (${result.newThreadId})`);
@@ -309,7 +348,7 @@ export default async function plugin(bb: BbPluginApi) {
         summary:
           "Capture a thread and spawn a new thread on another provider — and optionally another machine — seeded with it",
         usage:
-          "bb handoff <thread-id|--self> --to <provider> [--machine <host>] [--model <model>] [--workspace reuse|checkout|worktree|personal] [--instructions <text>] [--up-to-seq <n>] [--briefing] [--dry-run]",
+          "bb handoff <thread-id|--self> --to <provider> [--machine <host>] [--model <model>] [--effort <level>] [--workspace reuse|checkout|worktree|personal] [--instructions <text>] [--up-to-seq <n>] [--briefing] [--dry-run]",
       },
       {
         name: "export",
@@ -352,8 +391,12 @@ export default async function plugin(bb: BbPluginApi) {
           "bb handoff — move a session between agents and machines, in both directions",
           "",
           "  bb handoff <thread-id|--self> --to <provider> [--machine <host>] [--model <m>]",
+          "             [--effort none|low|medium|high|xhigh|ultracode|max|ultra]",
           "             [--workspace reuse|checkout|worktree|personal]",
           "             [--instructions <text>] [--up-to-seq <n>] [--briefing] [--dry-run]",
+          "             --effort sets the new thread's thinking effort; omit to use the",
+          "             target model's own default. Run `bb handoff targets` for providers,",
+          "             and note that the levels a model accepts vary by model.",
           "             --briefing asks the (idle) source agent for a handoff note first",
           "             --machine runs the new thread on another enrolled machine. The source's",
           "             uncommitted work travels with it as a patch; reuse is same-machine only,",
@@ -374,7 +417,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (handoffs.length === 0) return { exitCode: 0, stdout: "No handoffs recorded yet.\n" };
         const lines = handoffs.map(
           (record) =>
-            `${new Date(record.at).toISOString()}  ${record.sourceThreadId} (${record.sourceProvider}) → ${record.targetThreadId} (${record.targetProvider}${record.model ? `/${record.model}` : ""}, ${record.workspace}${record.targetMachine ? ` @ ${record.targetMachine}` : ""})`,
+            `${new Date(record.at).toISOString()}  ${record.sourceThreadId} (${record.sourceProvider}) → ${record.targetThreadId} (${record.targetProvider}${record.model ? `/${record.model}` : ""}${record.reasoningLevel ? ` @${record.reasoningLevel}` : ""}, ${record.workspace}${record.targetMachine ? ` @ ${record.targetMachine}` : ""})`,
         );
         return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
       }
@@ -457,6 +500,12 @@ export default async function plugin(bb: BbPluginApi) {
         if (upToSeqRaw && (!Number.isInteger(upToSeq) || upToSeq! <= 0)) {
           return fail("--up-to-seq must be a positive integer (a message's sourceSeqEnd).");
         }
+        const effortRaw = flags.get("--effort");
+        const effort = effortRaw ? reasoningLevelSchema.safeParse(effortRaw) : null;
+        if (effortRaw && !effort?.success) {
+          return fail(`--effort must be one of ${reasoningLevelSchema.options.join(", ")}.`);
+        }
+        const reasoningLevel = effort?.success ? effort.data : undefined;
         if (flags.has("--dry-run")) {
           const captured = await captureThread(bb, threadId, { untilSeq: upToSeq });
           let plan: TransferPlan;
@@ -505,6 +554,7 @@ export default async function plugin(bb: BbPluginApi) {
             sourceThreadId: threadId,
             providerId,
             model: flags.get("--model"),
+            reasoningLevel,
             workspace,
             machine,
             extraInstructions: flags.get("--instructions"),

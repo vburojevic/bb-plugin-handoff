@@ -165,6 +165,35 @@ describe("startHandoff", () => {
     expect(stages).toEqual(["capturing", "rendering", "uploading", "spawning", "done"]);
   });
 
+  it("passes the requested thinking effort to the target thread", async () => {
+    const { bb, calls, kv } = makeFakeBb();
+    await startHandoff(bb, {
+      sourceThreadId: "thr_src",
+      providerId: "codex",
+      workspace: "reuse",
+      reasoningLevel: "xhigh",
+    });
+    const spawn = calls.find((call) => call.method === "threads.spawn")!.args as {
+      reasoningLevel?: string;
+    };
+    expect(spawn.reasoningLevel).toBe("xhigh");
+
+    const key = [...kv.keys()].find((entry) => entry.startsWith("handoff:"))!;
+    expect(kv.get(key)).toMatchObject({ reasoningLevel: "xhigh" });
+  });
+
+  it("omits the effort entirely when none is requested, so the model's default stands", async () => {
+    const { bb, calls } = makeFakeBb();
+    await startHandoff(bb, { sourceThreadId: "thr_src", providerId: "codex", workspace: "reuse" });
+    const spawn = calls.find((call) => call.method === "threads.spawn")!.args as Record<
+      string,
+      unknown
+    >;
+    // Present-but-undefined would be sent as an explicit null downstream and
+    // could read as "no thinking"; the key must be absent.
+    expect(Object.hasOwn(spawn, "reasoningLevel")).toBe(false);
+  });
+
   it("uses a managed worktree on the source host when asked", async () => {
     const { bb, calls } = makeFakeBb();
     await startHandoff(bb, { sourceThreadId: "thr_src", providerId: "codex", workspace: "worktree" });

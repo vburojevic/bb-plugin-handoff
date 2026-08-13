@@ -77,6 +77,7 @@ interface HandoffRow {
   targetThreadId: string;
   targetProvider: string;
   model: string | null;
+  reasoningLevel?: ReasoningLevel | null;
   workspace: WorkspaceMode;
   at: number;
   verification?: "pending" | "confirmed" | "failed";
@@ -235,6 +236,36 @@ function RouteChip({
   );
 }
 
+type ReasoningLevel =
+  | "none"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "ultracode"
+  | "max"
+  | "ultra";
+
+type ModelOption = {
+  model: string;
+  displayName: string;
+  isDefault: boolean;
+  defaultReasoningEffort: ReasoningLevel;
+  supportedReasoningEfforts: { reasoningEffort: ReasoningLevel; description: string }[];
+};
+
+/** Compact labels: the picker sits inline and the full names do not fit. */
+const EFFORT_LABELS: Record<ReasoningLevel, string> = {
+  none: "None",
+  low: "Low",
+  medium: "Med",
+  high: "High",
+  xhigh: "X-high",
+  ultracode: "Ultra-c",
+  max: "Max",
+  ultra: "Ultra",
+};
+
 interface HandoffScope {
   upToSeq: number;
   messagePreview: string;
@@ -268,9 +299,11 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
   const [retryNonce, setRetryNonce] = useState(0);
   const [providers, setProviders] = useState<TargetProvider[] | null>(null);
   const [providerId, setProviderId] = useState<string>("");
-  const [models, setModels] = useState<{ model: string; displayName: string }[]>([]);
+  const [models, setModels] = useState<ModelOption[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [model, setModel] = useState<string>("__default__");
+  /** "" while no model is resolved yet; otherwise a level that model accepts. */
+  const [effort, setEffort] = useState<ReasoningLevel | "">("");
   const [workspace, setWorkspace] = useState<WorkspaceMode>("reuse");
   const [machines, setMachines] = useState<Machine[]>([]);
   const [sourceMachineId, setSourceMachineId] = useState<string | null>(null);
@@ -372,6 +405,21 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
     () => providers?.find((provider) => provider.id === providerId) ?? null,
     [providers, providerId],
   );
+  // "Provider default" is not a model, so resolve it to the one the provider
+  // marks default — that is whose effort levels the picker must offer.
+  const activeModel = useMemo(
+    () =>
+      (model === "__default__"
+        ? models.find((entry) => entry.isDefault)
+        : models.find((entry) => entry.model === model)) ?? null,
+    [models, model],
+  );
+  const efforts = activeModel?.supportedReasoningEfforts ?? [];
+  // Supported levels are per model, so changing the model re-seeds from that
+  // model's own default instead of carrying a level it may not accept.
+  useEffect(() => {
+    setEffort(activeModel?.defaultReasoningEffort ?? "");
+  }, [activeModel]);
   // Available targets first; unavailable ones sink to the end but stay visible.
   const sortedProviders = useMemo(
     () =>
@@ -465,6 +513,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
         threadId,
         providerId,
         ...(model !== "__default__" ? { model } : {}),
+        ...(effort ? { reasoningLevel: effort } : {}),
         workspace,
         ...(machineId ? { machineId } : {}),
         briefing,
@@ -490,6 +539,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
     threadId,
     providerId,
     model,
+    effort,
     workspace,
     machineId,
     briefing,
@@ -758,6 +808,38 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
               </div>
             ) : null}
 
+            {/* Thinking effort — only when the model offers a real choice. */}
+            {efforts.length > 1 ? (
+              <div className="flex flex-col gap-2 animate-in fade-in-0 duration-200">
+                <Label htmlFor="handoff-effort">Thinking effort</Label>
+                <Select
+                  value={effort}
+                  onValueChange={(value) => setEffort(value as ReasoningLevel)}
+                >
+                  <SelectTrigger id="handoff-effort">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {efforts.map((entry) => (
+                        <SelectItem key={entry.reasoningEffort} value={entry.reasoningEffort}>
+                          {EFFORT_LABELS[entry.reasoningEffort] ?? entry.reasoningEffort}
+                          {entry.reasoningEffort === activeModel?.defaultReasoningEffort
+                            ? " (default)"
+                            : ""}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                {efforts.find((entry) => entry.reasoningEffort === effort)?.description ? (
+                  <p className="text-xs text-muted-foreground">
+                    {efforts.find((entry) => entry.reasoningEffort === effort)?.description}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
             {/* Workspace */}
             <div className="flex flex-col gap-2">
               <Label>Workspace</Label>
@@ -900,6 +982,9 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                       <span className="truncate font-medium">
                         {providerName(row.targetProvider)}
                         {row.model ? ` · ${row.model}` : ""}
+                        {row.reasoningLevel
+                          ? ` · ${EFFORT_LABELS[row.reasoningLevel] ?? row.reasoningLevel}`
+                          : ""}
                       </span>
                       {row.targetMachine ? (
                         <span className="shrink-0 rounded bg-muted px-1 py-px text-[10px] leading-tight text-muted-foreground">
