@@ -39,6 +39,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { omitUndefined } from "@/lib/rpc-input";
 import { cn } from "@/lib/utils";
 
 type WorkspaceMode = "reuse" | "checkout" | "worktree" | "personal";
@@ -312,7 +313,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
     setStats(null);
     setStatsError(null);
     rpc
-      .call("prepareHandoff", { threadId, upToSeq })
+      .call("prepareHandoff", omitUndefined({ threadId, upToSeq }))
       .then((result) => {
         if (cancelled) return;
         setStats(result);
@@ -450,7 +451,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
     setPreviewOpen(true);
     if (preview || previewError) return;
     rpc
-      .call("previewHandoff", { threadId, upToSeq })
+      .call("previewHandoff", omitUndefined({ threadId, upToSeq }))
       .then(setPreview)
       .catch(() => setPreviewError(true));
   }, [rpc, threadId, upToSeq, preview, previewError]);
