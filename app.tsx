@@ -5,7 +5,7 @@
 // picker, workspace, notes) with a sticky action footer that turns into a
 // live progress rail during a handoff.
 // In: the "Adopt agent session" compose-screen section (adopt/section.tsx).
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   definePluginApp,
   Markdown,
@@ -504,8 +504,15 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
       .catch(() => setPreviewError(true));
   }, [rpc, threadId, upToSeq, preview, previewError]);
 
+  // `pending` swaps the button for the progress rail, but only on the next
+  // render — a second activation in the same tick still gets through. The
+  // server refuses a concurrent handoff of the same thread; this just keeps
+  // the common case from ever asking.
+  const starting = useRef(false);
+
   const start = useCallback(async () => {
-    if (!providerId) return;
+    if (!providerId || starting.current) return;
+    starting.current = true;
     setPending(true);
     setStage("capturing");
     try {
@@ -531,6 +538,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
       navigate.toThread(result.newThreadId);
     } catch (error: unknown) {
       toast.error(error instanceof Error ? error.message : "Handoff failed");
+      starting.current = false;
       setPending(false);
       setStage(null);
     }

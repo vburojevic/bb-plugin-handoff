@@ -486,7 +486,28 @@ export interface HandoffResult {
   notes: string[];
 }
 
+/**
+ * Source threads with a handoff running right now. Nothing downstream of the
+ * panel's `pending` flag says no to a second run, and that flag is local
+ * component state: it does not survive the panel remounting, a reload, a second
+ * bb window, or a `bb handoff` alongside the UI. A handoff is long (a briefing
+ * turn alone can take 90s) and not idempotent — it steers the source agent and
+ * spawns a thread — so a second click during the first run produced a second
+ * target thread, both seeded from the same session.
+ *
+ * Keyed by source thread, not by target: two concurrent handoffs of one thread
+ * both send it a briefing prompt, and the second's waiter would displace the
+ * first's. Fanning out to several providers is a sequence, not a race.
+ */
+const inFlightHandoffs = new Set<string>();
+
 export async function startHandoff(bb: BbPluginApi, request: HandoffRequest): Promise<HandoffResult> {
+  if (inFlightHandoffs.has(request.sourceThreadId)) {
+    throw new TransferError(
+      "A handoff of this thread is already running — wait for it to finish before starting another.",
+    );
+  }
+  inFlightHandoffs.add(request.sourceThreadId);
   const publish = (stage: string, extra?: Record<string, unknown>) =>
     bb.realtime.publish(REALTIME_CHANNEL, { sourceThreadId: request.sourceThreadId, stage, ...extra });
   try {
@@ -494,6 +515,8 @@ export async function startHandoff(bb: BbPluginApi, request: HandoffRequest): Pr
   } catch (error) {
     publish("failed", { message: error instanceof Error ? error.message : String(error) });
     throw error;
+  } finally {
+    inFlightHandoffs.delete(request.sourceThreadId);
   }
 }
 

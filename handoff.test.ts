@@ -18,7 +18,13 @@ interface RecordedCall {
  * this bb build). Live behavior is covered by the bb plugin dev loop.
  */
 function makeFakeBb(
-  options: { spawnError?: Error; threadStatus?: string; briefingReply?: string } = {},
+  options: {
+    spawnError?: Error;
+    threadStatus?: string;
+    briefingReply?: string;
+    /** Holds the spawn open, so a second handoff can overlap the first. */
+    spawnGate?: Promise<void>;
+  } = {},
 ) {
   const calls: RecordedCall[] = [];
   const kv = new Map<string, unknown>();
@@ -80,6 +86,7 @@ function makeFakeBb(
         },
         spawn: async (args: unknown) => {
           record("threads.spawn", args);
+          if (options.spawnGate) await options.spawnGate;
           if (options.spawnError) throw options.spawnError;
           return { id: "thr_new" };
         },
@@ -346,6 +353,27 @@ describe("startHandoff", () => {
     };
     const doc = new TextDecoder().decode(upload.clientFile);
     expect(doc).not.toContain("## Briefing from the outgoing agent");
+  });
+
+  it("refuses a second handoff while one is still running on the same thread", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { bb, calls } = makeFakeBb({ spawnGate: gate });
+    const request = { sourceThreadId: "thr_src", providerId: "codex", workspace: "reuse" } as const;
+
+    const first = startHandoff(bb, { ...request });
+    await expect(startHandoff(bb, { ...request })).rejects.toThrow(/already running/);
+
+    release();
+    await first;
+    expect(calls.filter((call) => call.method === "threads.spawn")).toHaveLength(1);
+
+    // The guard is per-run, not a permanent lock: handing the thread off again
+    // once the first finished is allowed.
+    await startHandoff(bb, { ...request });
+    expect(calls.filter((call) => call.method === "threads.spawn")).toHaveLength(2);
   });
 
   it("publishes a failed stage and rethrows when spawning fails", async () => {
