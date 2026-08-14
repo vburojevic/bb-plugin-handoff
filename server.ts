@@ -34,6 +34,17 @@ import {
 const workspaceModeSchema = z.enum(["reuse", "checkout", "worktree", "personal"]);
 
 /**
+ * What `--briefing` actually got. Only the outcomes worth acting on: silence
+ * would read as "the briefing is in the document" when it is not.
+ */
+const BRIEFING_CLI_NOTE: Record<string, string> = {
+  "skipped-busy": "Briefing skipped: the source agent was mid-turn.",
+  "skipped-blocked":
+    "Briefing skipped: the source agent is blocked on a question or approval — answer it in the source thread if you still want one.",
+  "skipped-unanswered": "Briefing skipped: the source agent did not answer in time.",
+};
+
+/**
  * Thinking effort for the target thread. Mirrors bb's `ReasoningLevel`, which
  * the SDK declares but does not export. Never offer these blind: the levels a
  * model actually accepts differ per model, and `providers.models()` reports
@@ -139,7 +150,13 @@ export const rpcContract = defineRpcContract({
     output: z.object({
       newThreadId: z.string(),
       docBytes: z.number(),
-      briefing: z.enum(["included", "skipped-busy", "skipped-unanswered", "off"]),
+      briefing: z.enum([
+        "included",
+        "skipped-busy",
+        "skipped-blocked",
+        "skipped-unanswered",
+        "off",
+      ]),
       targetMachine: z.string().nullable(),
       crossMachine: z.boolean(),
       patchPath: z.string().nullable(),
@@ -568,6 +585,7 @@ export default async function plugin(bb: BbPluginApi) {
         const where = result.crossMachine ? ` on ${result.targetMachine}` : "";
         const extra = [
           result.patchPath ? `Carried the source's uncommitted changes to ${result.patchPath}.` : "",
+          BRIEFING_CLI_NOTE[result.briefing] ?? "",
           ...result.notes,
         ].filter(Boolean);
         return {

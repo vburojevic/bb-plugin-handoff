@@ -77,7 +77,13 @@ export interface HandoffRecord {
   targetMachine?: string | null;
 }
 
-export type BriefingOutcome = "included" | "skipped-busy" | "skipped-unanswered" | "off";
+export type BriefingOutcome =
+  | "included"
+  | "skipped-busy"
+  /** The source agent is blocked on the user — an approval or a question. */
+  | "skipped-blocked"
+  | "skipped-unanswered"
+  | "off";
 
 export const REALTIME_CHANNEL = "handoff:progress";
 
@@ -87,6 +93,12 @@ export const HISTORY_LIMIT = 100;
 // --- Briefing: ask the outgoing agent to write a handoff note ---------------
 
 export const BRIEFING_TIMEOUT_MS = 90_000;
+
+/**
+ * How often the briefing wait re-checks whether the source agent stopped to
+ * ask something. Cheap (one local query) next to the 90s it saves.
+ */
+export const BRIEFING_POLL_MS = 2_000;
 
 const BRIEFING_PROMPT = [
   "This session is being handed off to another agent. Before the transfer, write a handoff briefing for your successor. Reply with only the briefing:",
@@ -112,10 +124,40 @@ export function settleBriefing(threadId: string, text: string | null): void {
 }
 
 /**
+ * Whether the source agent is blocked on the user right now — an approval it
+ * needs granted, or a question it asked. bb tracks this outside the thread's
+ * status: a blocked run has not settled, so the thread sits at `active` and
+ * looks exactly like one still working, and `thread.idle` never arrives.
+ * Answering is the user's call, so this only ever reports; it never resolves
+ * or cancels the interaction.
+ */
+async function blockedOnUser(bb: BbPluginApi, threadId: string): Promise<boolean | null> {
+  try {
+    const interactions = await bb.sdk.threads.interactions.list({ threadId });
+    return interactions.some((interaction) => interaction.status === "pending");
+  } catch {
+    // Can't ask. null, not false: the caller stops polling and falls back to
+    // the timeout rather than re-asking a question that is not being answered.
+    return null;
+  }
+}
+
+/** How the wait for the briefing ended. */
+type BriefingWait =
+  | { kind: "answered"; text: string | null }
+  | { kind: "blocked" };
+
+/**
  * Send the briefing prompt to the source thread and wait for its answer.
- * Only runs against an idle thread — a busy source is never steered off its
- * in-flight turn (this also makes agent-initiated `bb handoff --self` skip
- * the briefing naturally, since that thread is mid-turn running the CLI).
+ * Only runs against an idle thread with nothing outstanding for the user — a
+ * busy source is never steered off its in-flight turn (this also makes
+ * agent-initiated `bb handoff --self` skip the briefing naturally, since that
+ * thread is mid-turn running the CLI), and one already waiting on an answer is
+ * not handed a second question on top of the first.
+ *
+ * The wait ends three ways: the turn completes (the answer), the agent stops to
+ * ask something (give up now — that turn cannot finish without the user, so the
+ * remaining timeout is dead time), or the timeout.
  */
 async function requestBriefing(
   bb: BbPluginApi,
@@ -125,26 +167,54 @@ async function requestBriefing(
     // deno-lint-ignore no-explicit-any
     const thread = (await bb.sdk.threads.get({ threadId })) as any;
     if (thread.status !== "idle") return { text: null, outcome: "skipped-busy" };
+    if (thread.hasPendingInteraction) return { text: null, outcome: "skipped-blocked" };
   } catch {
     return { text: null, outcome: "skipped-busy" };
   }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const waited = new Promise<string | null>((resolve) => {
-    briefingWaiters.set(threadId, resolve);
-    timer = setTimeout(() => resolve(null), BRIEFING_TIMEOUT_MS);
+
+  let done = false;
+  let settle!: (value: BriefingWait) => void;
+  const waited = new Promise<BriefingWait>((resolve) => {
+    settle = resolve;
   });
+  briefingWaiters.set(threadId, (text) => settle({ kind: "answered", text }));
+  const timer = setTimeout(() => settle({ kind: "answered", text: null }), BRIEFING_TIMEOUT_MS);
+
+  // Self-scheduling rather than an interval: one slow lookup must not stack up
+  // behind itself, and nothing may outlive the wait.
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  const pollForBlock = () => {
+    pollTimer = setTimeout(async () => {
+      if (done) return;
+      const blocked = await blockedOnUser(bb, threadId);
+      if (blocked === null) {
+        bb.log.warn(`briefing: could not read pending interactions for ${threadId}`);
+        return;
+      }
+      if (blocked) settle({ kind: "blocked" });
+      else if (!done) pollForBlock();
+    }, BRIEFING_POLL_MS);
+  };
+
   try {
     await bb.sdk.threads.send({
       threadId,
       mode: "auto",
       input: [{ type: "text", text: BRIEFING_PROMPT, mentions: [] }],
     });
-    const text = await waited;
-    return { text, outcome: text?.trim() ? "included" : "skipped-unanswered" };
+    pollForBlock();
+    const result = await waited;
+    if (result.kind === "blocked") return { text: null, outcome: "skipped-blocked" };
+    return {
+      text: result.text,
+      outcome: result.text?.trim() ? "included" : "skipped-unanswered",
+    };
   } catch {
     return { text: null, outcome: "skipped-unanswered" };
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    done = true;
+    clearTimeout(timer);
+    if (pollTimer !== undefined) clearTimeout(pollTimer);
     briefingWaiters.delete(threadId);
   }
 }

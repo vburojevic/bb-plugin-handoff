@@ -87,6 +87,7 @@ interface HandoffRow {
 const BRIEFING_TOAST: Record<string, string> = {
   included: " — briefing included",
   "skipped-busy": " — briefing skipped, the source agent was busy",
+  "skipped-blocked": " — briefing skipped, the source agent is waiting on you",
   "skipped-unanswered": " — briefing skipped, no answer in time",
 };
 

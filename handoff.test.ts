@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import {
+  BRIEFING_POLL_MS,
   HISTORY_LIMIT,
   settleBriefing,
   settleVerification,
@@ -24,11 +25,16 @@ function makeFakeBb(
     briefingReply?: string;
     /** Holds the spawn open, so a second handoff can overlap the first. */
     spawnGate?: Promise<void>;
+    /** The thread already has a question or approval waiting on the user. */
+    pendingInteraction?: boolean;
+    /** The briefing turn stops to ask something instead of answering. */
+    briefingAsksQuestion?: boolean;
   } = {},
 ) {
   const calls: RecordedCall[] = [];
   const kv = new Map<string, unknown>();
   const record = (method: string, args: unknown) => calls.push({ method, args });
+  let blocked = options.pendingInteraction ?? false;
 
   const events = [
     { seq: 1, type: "turn/started", data: { providerThreadId: "sess-1" } },
@@ -65,14 +71,36 @@ function makeFakeBb(
             projectId: "proj_1",
             environmentId: "env_1",
             status: options.threadStatus ?? "idle",
+            hasPendingInteraction: blocked,
           };
         },
         send: async (args: unknown) => {
           record("threads.send", args);
+          if (options.briefingAsksQuestion) {
+            // The agent stops to ask instead of answering: the thread stays
+            // active, so no idle ever arrives for this turn.
+            blocked = true;
+            return;
+          }
           // The briefing turn "completes" right after the send resolves.
           queueMicrotask(() =>
             settleBriefing("thr_src", options.briefingReply ?? "Briefing: step one is done."),
           );
+        },
+        interactions: {
+          list: async (args: unknown) => {
+            record("threads.interactions.list", args);
+            return blocked
+              ? [
+                  {
+                    id: "int_1",
+                    threadId: "thr_src",
+                    status: "pending",
+                    payload: { kind: "user_question" },
+                  },
+                ]
+              : [];
+          },
         },
         events: {
           list: async (args: unknown) => {
@@ -336,6 +364,54 @@ describe("startHandoff", () => {
     await settleVerification(bb, "thr_new", false);
     const key = [...kv.keys()].find((k) => k.startsWith("handoff:") && k.endsWith(":thr_new"))!;
     expect((kv.get(key) as { verification?: string }).verification).toBe("failed");
+  });
+
+  it("does not ask for a briefing while the agent is already waiting on the user", async () => {
+    const { bb, calls } = makeFakeBb({ pendingInteraction: true });
+    const result = await startHandoff(bb, {
+      sourceThreadId: "thr_src",
+      providerId: "codex",
+      workspace: "reuse",
+      briefing: true,
+    });
+
+    // An idle thread with a question outstanding must not be handed a second
+    // question on top of the first.
+    expect(result.briefing).toBe("skipped-blocked");
+    expect(calls.some((call) => call.method === "threads.send")).toBe(false);
+    expect(result.newThreadId).toBe("thr_new");
+  });
+
+  it("gives up on the briefing as soon as the agent stops to ask something", async () => {
+    vi.useFakeTimers();
+    try {
+      const { bb, calls } = makeFakeBb({ briefingAsksQuestion: true });
+      const running = startHandoff(bb, {
+        sourceThreadId: "thr_src",
+        providerId: "codex",
+        workspace: "reuse",
+        briefing: true,
+      });
+      // Well short of BRIEFING_TIMEOUT_MS: the point is that it does not sit
+      // there for the full 90s waiting on a turn that cannot finish.
+      for (let tick = 0; tick < 5; tick++) await vi.advanceTimersByTimeAsync(BRIEFING_POLL_MS);
+      const result = await running;
+
+      expect(result.briefing).toBe("skipped-blocked");
+      expect(calls.some((call) => call.method === "threads.interactions.list")).toBe(true);
+      // The question is the user's to answer — the handoff only reports it.
+      expect(calls.some((call) => call.method.startsWith("threads.interactions.cancel"))).toBe(false);
+
+      // The handoff still lands, just without a briefing section.
+      expect(result.newThreadId).toBe("thr_new");
+      const upload = calls.find((call) => call.method === "attachments.upload")!.args as {
+        clientFile: Uint8Array;
+      };
+      const doc = new TextDecoder().decode(upload.clientFile);
+      expect(doc).not.toContain("## Briefing from the outgoing agent");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("skips the briefing when the source thread is busy", async () => {
