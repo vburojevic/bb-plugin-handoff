@@ -27,6 +27,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { COARSE_POINTER_INPUT_HEIGHT_CLASS } from "@/components/ui/coarse-pointer-sizing";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
@@ -91,6 +92,7 @@ function SessionRowButton({
       className={cn(
         "flex w-full flex-col gap-1 rounded-md border border-border px-3 py-2 text-left transition-colors",
         "hover:border-ring hover:bg-accent/50 disabled:pointer-events-none disabled:opacity-60",
+        "max-md:pointer-coarse:py-3",
         "sm:flex-row sm:items-center sm:gap-3",
       )}
     >
@@ -300,7 +302,7 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
         <Button
           variant="ghost"
           size="sm"
-          className="h-auto w-full justify-start gap-2 px-2 py-2 font-normal text-muted-foreground"
+          className="h-auto w-full justify-start gap-2 px-2 py-2 font-normal text-muted-foreground max-md:pointer-coarse:py-3"
         >
           <Icon name="Download" aria-hidden />
           <span className="min-w-0 flex-1 truncate text-left">
@@ -315,7 +317,12 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
             {/* Machine — only when more than one is enrolled */}
             {machines && machines.length > 1 ? (
               <div className="flex flex-col gap-1.5">
-                <div className="flex items-center gap-2">
+                {/*
+                  Stacks on a phone: side by side, the trigger cannot shrink
+                  below a long machine name, and truncating one hides exactly
+                  the suffix that tells two machines apart (…-Pro vs …-Air).
+                */}
+                <div className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-2">
                   <Label
                     htmlFor="adopt-machine"
                     className="shrink-0 text-xs font-normal text-muted-foreground"
@@ -332,7 +339,11 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
                       setAlready(null);
                     }}
                   >
-                    <SelectTrigger id="adopt-machine" className="h-8 flex-1" aria-label="Machine">
+                    <SelectTrigger
+                      id="adopt-machine"
+                      className="h-8 w-full min-w-0 max-md:pointer-coarse:h-10 sm:flex-1"
+                      aria-label="Machine"
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -388,13 +399,17 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
                 autoCorrect="off"
                 spellCheck={false}
                 enterKeyHint="go"
-                className="flex-1 font-mono text-xs"
+                // w-full until sm, not flex-1: this row is a COLUMN on a phone,
+                // where flex-1 puts flex-basis on the HEIGHT axis and silently
+                // overrides the control's own h-9/h-10, collapsing it to text
+                // height. flex-1 is only correct once the row is horizontal.
+                className="w-full font-mono text-xs sm:flex-1"
               />
               <Button
                 variant="secondary"
                 onClick={() => adoptQuery()}
                 disabled={!query.trim() || busy !== null}
-                className="sm:shrink-0"
+                className="max-md:pointer-coarse:h-10 sm:shrink-0"
               >
                 {busy === "query" ? "Adopting…" : "Adopt session"}
               </Button>
@@ -459,7 +474,7 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="w-full justify-between px-2 text-muted-foreground"
+                  className="w-full justify-between px-2 text-muted-foreground max-md:pointer-coarse:h-10"
                 >
                   Browse recent sessions
                   <Icon name={browseOpen ? "ChevronUp" : "ChevronDown"} aria-hidden />
@@ -473,7 +488,10 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
                         value={pickedProjectId ?? ""}
                         onValueChange={(value) => setPickedProjectId(value || null)}
                       >
-                        <SelectTrigger className="w-full sm:w-44 sm:shrink-0" aria-label="Project">
+                        <SelectTrigger
+                          className={cn(COARSE_POINTER_INPUT_HEIGHT_CLASS, "w-full sm:w-44 sm:shrink-0")}
+                          aria-label="Project"
+                        >
                           <SelectValue placeholder="Project…" />
                         </SelectTrigger>
                         <SelectContent>
@@ -508,7 +526,7 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
                         onClick={() => load(cwd.trim() || null)}
                         disabled={loading}
                         aria-label="Refresh sessions"
-                        className="shrink-0"
+                        className="shrink-0 max-md:pointer-coarse:size-10"
                       >
                         <Icon name="ArrowReloadHorizontal" aria-hidden />
                       </Button>

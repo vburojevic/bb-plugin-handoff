@@ -18,6 +18,9 @@ import type { rpcContract } from "./server";
 import { AdoptSection } from "./adopt/section";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+// bb's vendored controls carry no coarse-pointer sizing of their own — the app
+// adds it per call site, so a plugin that wants to feel native must too.
+import { COARSE_POINTER_INPUT_HEIGHT_CLASS } from "@/components/ui/coarse-pointer-sizing";
 import {
   Dialog,
   DialogContent,
@@ -692,7 +695,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                   value={machineId || "__source__"}
                   onValueChange={(value) => setMachineId(value === "__source__" ? "" : value)}
                 >
-                  <SelectTrigger id="handoff-machine">
+                  <SelectTrigger id="handoff-machine" className={COARSE_POINTER_INPUT_HEIGHT_CLASS}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -806,7 +809,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
               <div className="flex flex-col gap-2 animate-in fade-in-0 duration-200">
                 <Label htmlFor="handoff-model">Model</Label>
                 <Select value={model} onValueChange={setModel}>
-                  <SelectTrigger id="handoff-model">
+                  <SelectTrigger id="handoff-model" className={COARSE_POINTER_INPUT_HEIGHT_CLASS}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -831,7 +834,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                   value={effort}
                   onValueChange={(value) => setEffort(value as ReasoningLevel)}
                 >
-                  <SelectTrigger id="handoff-effort">
+                  <SelectTrigger id="handoff-effort" className={COARSE_POINTER_INPUT_HEIGHT_CLASS}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -994,7 +997,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                     type="button"
                     title={new Date(row.at).toLocaleString()}
                     onClick={() => navigate.toThread(row.targetThreadId)}
-                    className="group -mx-2 flex items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    className="group -mx-2 flex items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring max-md:pointer-coarse:py-2.5"
                   >
                     <span className="w-16 shrink-0 text-xs text-muted-foreground tabular-nums">
                       {timeAgo(row.at)}
@@ -1043,8 +1046,13 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
         {/* Footer */}
         <div className="border-t bg-background p-3">
           {pending ? (
-            <div className="flex items-center justify-between gap-3" aria-live="polite">
-              <div className="flex items-center gap-3">
+            <div className="flex items-start justify-between gap-3" aria-live="polite">
+              {/*
+                All six stages need ~430px of labels; a phone-width panel has
+                roughly 280. Wrapping keeps every stage readable instead of
+                shoving the target-provider label off the edge.
+              */}
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1">
                 {railStages.map((step, index) => {
                   const done = stage === "done" || index < stageIndex;
                   const active = index === stageIndex && stage !== "done";
@@ -1052,7 +1060,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                     <span
                       key={step.key}
                       className={cn(
-                        "flex items-center gap-1.5 text-xs transition-colors",
+                        "flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs transition-colors",
                         done || active ? "text-foreground" : "text-muted-foreground/60",
                       )}
                     >
@@ -1068,18 +1076,30 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                   );
                 })}
               </div>
-              <span className="min-w-0 truncate text-xs text-muted-foreground">
+              <span className="max-w-[45%] shrink-0 truncate text-xs text-muted-foreground">
                 → {selectedProvider?.displayName ?? providerId}
               </span>
             </div>
           ) : (
             <div className="flex items-center justify-between gap-3">
-              <Button variant="ghost" size="sm" onClick={openPreview} disabled={!stats}>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={openPreview}
+                disabled={!stats}
+                className="max-md:pointer-coarse:h-10"
+              >
                 <Icon name="FileText" aria-hidden />
                 Preview
               </Button>
-              <Button onClick={() => void start()} disabled={!providerId || !stats}>
-                {selectedProvider ? `Hand off to ${selectedProvider.displayName}` : "Hand off"}
+              <Button
+                onClick={() => void start()}
+                disabled={!providerId || !stats}
+                className="min-w-0 max-md:pointer-coarse:h-10"
+              >
+                <span className="truncate">
+                  {selectedProvider ? `Hand off to ${selectedProvider.displayName}` : "Hand off"}
+                </span>
                 <Icon name="ArrowRight" aria-hidden />
               </Button>
             </div>
