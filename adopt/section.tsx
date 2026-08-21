@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/collapsible";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -38,6 +39,12 @@ const AGENT_LABELS: Record<string, string> = {
 
 const VISIBLE_SESSIONS = 5;
 
+/**
+ * Mirrors the backend's LIVE_SESSION_WINDOW_MS: a session with store activity
+ * this recent may still be running in a terminal.
+ */
+const LIVE_WINDOW_MS = 10 * 60_000;
+
 function formatAge(ms: number): string {
   const minutes = Math.round(ms / 60_000);
   if (minutes < 1) return "now";
@@ -57,6 +64,8 @@ type SessionRow = {
 
 type ProjectRow = { id: string; name: string; path: string | null };
 
+type MachineRow = { id: string; name: string; connected: boolean; isPrimary: boolean };
+
 function SessionRowButton({
   session,
   subtitle,
@@ -72,6 +81,7 @@ function SessionRowButton({
   disabled: boolean;
   onAdopt: () => void;
 }) {
+  const possiblyLive = session.modifiedAtMs > 0 && Date.now() - session.modifiedAtMs < LIVE_WINDOW_MS;
   return (
     <button
       type="button"
@@ -91,6 +101,15 @@ function SessionRowButton({
         ) : null}
       </span>
       <span className="flex shrink-0 items-center gap-2">
+        {possiblyLive ? (
+          <span
+            className="inline-flex items-center gap-1 text-xs text-muted-foreground"
+            title="Recent activity — this session may still be running in a terminal"
+          >
+            <span className="size-1.5 animate-pulse rounded-full bg-primary" aria-hidden />
+            live?
+          </span>
+        ) : null}
         <Badge variant="secondary">{AGENT_LABELS[session.agent] ?? session.agent}</Badge>
         <span className="text-xs tabular-nums text-muted-foreground">
           {busy ? "Adopting…" : formatAge(Date.now() - session.modifiedAtMs)}
@@ -116,6 +135,12 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
   /** Already-adopted outcome: offer opening the thread or force re-adopting. */
   const [already, setAlready] = useState<{ threadId: string; retry: () => void } | null>(null);
 
+  // Machine: sessions can be adopted from any enrolled machine. "" = this one.
+  const [machines, setMachines] = useState<MachineRow[] | null>(null);
+  const [machineId, setMachineId] = useState<string>("");
+  const remoteMachine =
+    machineId !== "" ? (machines?.find((m) => m.id === machineId && !m.isPrimary) ?? null) : null;
+
   // Secondary browse flow
   const [browseOpen, setBrowseOpen] = useState(false);
   const [projects, setProjects] = useState<ProjectRow[] | null>(null);
@@ -129,13 +154,25 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
   const [busy, setBusy] = useState<string | null>(null); // "query" | "<agent>:<id>"
   const requestSeq = useRef(0);
 
+  useEffect(() => {
+    if (!open || machines !== null) return;
+    rpc
+      .call("adoptMachines")
+      .then((result) => setMachines(result.machines))
+      .catch(() => setMachines([]));
+  }, [open, machines, rpc]);
+
   const load = useCallback(
     (cwdOverride: string | null) => {
       const seq = ++requestSeq.current;
       setLoading(true);
       setListError(null);
       rpc
-        .call("listSessions", { projectId, cwd: cwdOverride })
+        .call("listSessions", {
+          projectId,
+          cwd: cwdOverride,
+          ...(machineId ? { machineId } : {}),
+        })
         .then((result) => {
           if (seq !== requestSeq.current) return;
           setSessions(result.sessions);
@@ -151,10 +188,10 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
           if (seq === requestSeq.current) setLoading(false);
         });
     },
-    [projectId, rpc],
+    [projectId, machineId, rpc],
   );
 
-  // (Re)load the browse list when it is open and the project changes.
+  // (Re)load the browse list when it is open and the project or machine changes.
   useEffect(() => {
     if (!browseOpen) return;
     setCwd("");
@@ -206,12 +243,19 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
       setMatches(null);
       setAlready(null);
       rpc
-        .call("adopt", { query: trimmed, agent: null, sessionId: null, cwd: cwd.trim() || null, force })
+        .call("adopt", {
+          query: trimmed,
+          agent: null,
+          sessionId: null,
+          cwd: cwd.trim() || null,
+          force,
+          ...(machineId ? { machineId } : {}),
+        })
         .then((result) => handleOutcome(result, () => adoptQuery(true)))
         .catch(() => setInlineError("Adoption failed."))
         .finally(() => setBusy(null));
     },
-    [busy, cwd, handleOutcome, query, rpc],
+    [busy, cwd, handleOutcome, machineId, query, rpc],
   );
 
   const adoptDirect = useCallback(
@@ -232,12 +276,13 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
           sessionId: session.sessionId,
           cwd: directory,
           force,
+          ...(machineId ? { machineId } : {}),
         })
         .then((result) => handleOutcome(result, () => adoptDirect(session, directory, true)))
         .catch(() => setInlineError("Adoption failed."))
         .finally(() => setBusy(null));
     },
-    [busy, handleOutcome, rpc],
+    [busy, handleOutcome, machineId, rpc],
   );
 
   const visible = sessions?.slice(0, VISIBLE_SESSIONS) ?? [];
@@ -267,6 +312,62 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
       <CollapsibleContent>
         <Card className="mt-2">
           <CardContent className="flex flex-col gap-3 p-4">
+            {/* Machine — only when more than one is enrolled */}
+            {machines && machines.length > 1 ? (
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center gap-2">
+                  <Label
+                    htmlFor="adopt-machine"
+                    className="shrink-0 text-xs font-normal text-muted-foreground"
+                  >
+                    From machine
+                  </Label>
+                  <Select
+                    value={machineId || "__local__"}
+                    onValueChange={(value) => {
+                      setMachineId(value === "__local__" ? "" : value);
+                      setSessions(null);
+                      setMatches(null);
+                      setInlineError(null);
+                      setAlready(null);
+                    }}
+                  >
+                    <SelectTrigger id="adopt-machine" className="h-8 flex-1" aria-label="Machine">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value="__local__">
+                          {(() => {
+                            const primary = machines.find((m) => m.isPrimary);
+                            return primary ? `${primary.name} — this machine` : "This machine";
+                          })()}
+                        </SelectItem>
+                        {machines
+                          .filter((machine) => !machine.isPrimary)
+                          .map((machine) => (
+                            <SelectItem
+                              key={machine.id}
+                              value={machine.id}
+                              disabled={!machine.connected}
+                            >
+                              {machine.name}
+                              {machine.connected ? "" : " — disconnected"}
+                            </SelectItem>
+                          ))}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                </div>
+                {remoteMachine ? (
+                  <p className="text-xs leading-snug text-muted-foreground">
+                    Sessions are read from {remoteMachine.name}; the adopted thread runs there, in
+                    the session&apos;s own directory. Remote listings show no titles.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
             {/* Paste an id or resume command */}
             <div className="flex flex-col gap-2 sm:flex-row">
               <Input
@@ -426,7 +527,8 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
                     </p>
                   ) : visible.length === 0 ? (
                     <p className="text-sm text-muted-foreground">
-                      No agent sessions found for this directory.
+                      No agent sessions found for this directory
+                      {remoteMachine ? ` on ${remoteMachine.name}` : ""}.
                     </p>
                   ) : (
                     <div className="flex flex-col gap-1.5">

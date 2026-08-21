@@ -343,4 +343,26 @@ describe("renderHandoff wording", () => {
     });
     expect(doc).toContain("- Note: Branch `feature-x` does not exist on mini");
   });
+
+  it("keeps the dirty working-state section as separate markdown paragraphs", () => {
+    const doc = renderHandoff(CAPTURED, new Date(), null, {
+      transfer: CROSS,
+      working: {
+        ...CLEAN,
+        dirty: true,
+        files: [{ path: "src/a.ts", status: "M" }],
+        insertions: 9,
+        deletions: 1,
+        patch: "diff",
+        patchTruncated: false,
+      },
+      patchPath: "/tmp/p.patch",
+    });
+    // Paragraph breaks must survive: without them the branch line, the
+    // uncommitted-changes warning, and the file list all merge into one
+    // run-on paragraph when the document is rendered.
+    expect(doc).toContain("at commit `abc123def456`.\n\n**It had uncommitted changes");
+    expect(doc).toContain("unless you apply them.\n\n- `M` src/a.ts");
+    expect(doc).toContain("where it stood:\n\n```\ngit apply --3way /tmp/p.patch\n```");
+  });
 });

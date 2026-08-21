@@ -137,10 +137,15 @@ codex resume 019fd95c-907f-7eb1-8dfc-2aad427ffc09
 - The project is matched from the directory (longest project-source prefix);
   if nothing covers it, one is created.
 - A session with activity in the last ~10 minutes is flagged as "may still be
-  running", so the new agent watches for concurrent edits.
+  running" — in the session list and to the new agent, which watches for
+  concurrent edits.
 - `--machine <host>` adopts from another enrolled machine and runs the thread
   over there. Claude and Codex resolve from a session id alone; Gemini and
   OpenCode need `--cwd`, since their ids live inside a file and a SQLite row.
+  The panel has the same axis: a **From machine** picker appears once a second
+  machine is enrolled. And `bb handoff adopt` run from a bb thread that lives
+  on another machine follows that machine automatically — its directory is
+  over there, so that is where the sessions are read.
 
 ---
 
@@ -159,7 +164,7 @@ talks to your own bb and the session files already on your disks.
 # Hand off
 bb handoff --self --to codex                     # the current thread
 bb handoff <thread-id> --to acp-opencode \
-  --model <model> --workspace worktree \
+  --model <model> --effort high --workspace worktree \
   --instructions "Finish the tests first"
 bb handoff <thread-id> --to codex --briefing     # ask the source agent for a note first
 bb handoff <thread-id> --to codex --up-to-seq <n>   # only up to one message
@@ -225,8 +230,8 @@ lookup, `parse(file)` for transcript blocks — and registering it in
 
 ```sh
 npm install
-npm test            # 115 unit tests: capture/render, transfer planning,
-                    # adopt engine + adapters, remote store readers
+npm test            # 122 unit tests: capture/render, transfer planning,
+                    # adopt engine + adapters, remote store readers, CLI guards
 npm run typecheck
 bb plugin install . # register this checkout with your bb
 bb plugin dev       # watch loop: rebuild + reload on save

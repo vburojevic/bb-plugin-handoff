@@ -1,6 +1,8 @@
 // `bb handoff adopt …` — the CLI surface of the adopt direction: continue an
 // external agent session (Claude Code, Codex, Gemini CLI) as a bb thread.
 import type { BbPluginApi } from "@bb/plugin-sdk";
+import { deriveHomeDir } from "../capture";
+import { REASONING_LEVELS, type ReasoningLevel } from "../handoff";
 import {
   collectSessions,
   listRemoteSessionsForDirectory,
@@ -91,6 +93,8 @@ Usage:
                                  family as the session; gemini falls back to
                                  claude-code)
         --model <model>          Model override for the new thread
+        --effort <level>         Thinking effort for the new thread (default:
+                                 the model's own; levels vary per model)
         --max-chars <n>          Transcript context budget (default 150000)
         --force                  Re-adopt a session that was already adopted
         --dry-run                Show what would happen without creating a thread
@@ -109,7 +113,7 @@ export const adoptCommandSpecs = [
     summary:
       "Adopt a session that ran outside bb (Claude Code, Codex, Gemini CLI, OpenCode) — on this machine or any enrolled one — as a bb thread; `adopt list` shows what is adoptable",
     usage:
-      "bb handoff adopt [<session-id | resume command>] [--cwd <path>] [--agent claude|codex|gemini|opencode] [--machine <host>] [--home <path>] [--force] [--dry-run] [--json]  |  bb handoff adopt list [--machine <host>] [--cwd <path>] [--limit <n>]",
+      "bb handoff adopt [<session-id | resume command>] [--cwd <path>] [--agent claude|codex|gemini|opencode] [--machine <host>] [--home <path>] [--effort <level>] [--force] [--dry-run] [--json]  |  bb handoff adopt list [--machine <host>] [--cwd <path>] [--limit <n>]",
   },
 ];
 
@@ -119,6 +123,34 @@ export interface AdoptCliContext {
 }
 
 type CliResult = { exitCode: number; stdout?: string; stderr?: string };
+
+/**
+ * The enrolled machine the invoking thread runs on, when it is NOT the machine
+ * whose disk local adoption reads (the bb server's own host). Local store
+ * reads happen on the server, but an agent may run `bb handoff adopt` from a
+ * thread living on another machine — its cwd names a path over THERE, so "the
+ * newest session for this directory" means that machine's disk, not this one's.
+ */
+async function remoteInvokingHost(
+  bb: BbPluginApi,
+  threadId: string | null | undefined,
+): Promise<string | null> {
+  if (!threadId) return null;
+  try {
+    // deno-lint-ignore no-explicit-any
+    const thread = (await bb.sdk.threads.get({ threadId })) as any;
+    if (!thread.environmentId) return null;
+    const [environment, config] = await Promise.all([
+      bb.sdk.environments.get({ environmentId: thread.environmentId }),
+      bb.sdk.system.config(),
+    ]);
+    const hostId = environment.hostId ?? null;
+    const primaryHostId = config.primaryHostId ?? null;
+    return hostId && primaryHostId && hostId !== primaryHostId ? hostId : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Run `bb handoff adopt <argv…>` (argv excludes the "adopt" token). */
 export async function runAdoptCli(
@@ -147,7 +179,28 @@ export async function runAdoptCli(
     rest = argv;
   }
   const flags = parseArgs(rest);
-  const machine = flags.values.get("machine");
+  // A positional argument may be an id, an id prefix, or a whole pasted
+  // resume command; its shape decides the routing below. An explicit session
+  // id is looked up on the server machine as documented, while the cwd-based
+  // flows (bare adopt, newest-session, list) belong to the machine the
+  // invoking thread actually runs on.
+  const positionalQuery = flags.positional.join(" ").trim();
+  const parsedPositional = positionalQuery ? parseAdoptQuery(positionalQuery) : null;
+  const cwdBased = parsedPositional === null || parsedPositional.sessionId === null;
+  let machine = flags.values.get("machine");
+  /** Set when auto-routed to the invoking thread's machine: ctx.cwd is a path THERE. */
+  let autoRemoteCwd: string | null = null;
+  let remoteHostHint: string | null = null;
+  if (!machine && ctx.threadId) {
+    remoteHostHint = await remoteInvokingHost(bb, ctx.threadId);
+    if (remoteHostHint && cwdBased) {
+      machine = remoteHostHint;
+      autoRemoteCwd = ctx.cwd ?? null;
+    }
+  }
+  /** Explicit --home, else derived from the auto-routed cwd (a path on `machine`). */
+  const remoteHome = () =>
+    flags.values.get("home") ?? (autoRemoteCwd ? deriveHomeDir(autoRemoteCwd) : null);
   const cwd = flags.values.get("cwd") ?? ctx.cwd;
   if (!cwd && !machine) {
     return { exitCode: 1, stderr: "No working directory. Pass --cwd <path>." };
@@ -157,9 +210,11 @@ export async function runAdoptCli(
     const limit = Number(flags.values.get("limit") ?? "10");
     const take = Number.isFinite(limit) ? limit : 10;
     if (machine) {
-      // A remote listing is always directory-scoped: the invoking cwd is a
-      // path on THIS machine, so it is never assumed to exist over there.
-      const remoteCwd = flags.values.get("cwd");
+      // A remote listing is always directory-scoped: with an explicit
+      // --machine the invoking cwd is a path on THIS machine and is never
+      // assumed to exist over there. Auto-routed to the invoking thread's own
+      // machine, ctx.cwd IS a path there and works as the default.
+      const remoteCwd = flags.values.get("cwd") ?? autoRemoteCwd;
       if (!remoteCwd) {
         return {
           exitCode: 1,
@@ -169,7 +224,7 @@ export async function runAdoptCli(
       const result = await listRemoteSessionsForDirectory(bb, {
         machine,
         cwd: remoteCwd,
-        home: flags.values.get("home") ?? null,
+        home: remoteHome(),
         agent: flags.values.get("agent"),
       });
       if ("error" in result && !("sessions" in result)) {
@@ -216,20 +271,26 @@ export async function runAdoptCli(
     };
   }
 
+  const effortRaw = flags.values.get("effort");
+  if (effortRaw && !(REASONING_LEVELS as readonly string[]).includes(effortRaw)) {
+    return {
+      exitCode: 1,
+      stderr: `--effort must be one of ${REASONING_LEVELS.join(", ")}.`,
+    };
+  }
   const shared = {
     projectId: flags.values.get("project"),
     title: flags.values.get("title"),
     threadProviderId: flags.values.get("thread-provider"),
     model: flags.values.get("model"),
+    reasoningLevel: effortRaw as ReasoningLevel | undefined,
     maxChars: Number(flags.values.get("max-chars") ?? "150000"),
     force: flags.booleans.has("force"),
     dryRun: flags.booleans.has("dry-run"),
   };
-  // A positional argument may be an id, an id prefix, or a whole pasted
-  // resume command — route it through the query engine (global lookup).
-  const positionalQuery = flags.positional.join(" ").trim();
   const agentFlag = flags.values.get("agent");
-  if (machine && !positionalQuery && !flags.values.get("cwd")) {
+  const remoteCwd = flags.values.get("cwd") ?? autoRemoteCwd;
+  if (machine && !positionalQuery && !remoteCwd) {
     return {
       exitCode: 1,
       stderr: `Adopting from another machine needs a session id, or --cwd <path> for its newest session: bb handoff adopt <id> --machine ${machine}`,
@@ -241,8 +302,8 @@ export async function runAdoptCli(
         ...(positionalQuery
           ? { query: agentFlag ? `${agentFlag} ${positionalQuery}` : positionalQuery }
           : {}),
-        cwd: flags.values.get("cwd") ?? null,
-        home: flags.values.get("home") ?? null,
+        cwd: remoteCwd,
+        home: remoteHome(),
         agent: agentFlag,
         ...shared,
       })
@@ -263,7 +324,9 @@ export async function runAdoptCli(
       outcome.code === "already-adopted"
         ? `\nOpen it with: bb thread open ${outcome.existingThreadId}\nPass --force to adopt it again.`
         : outcome.code === "not-found" && !machine
-          ? `\nRun: bb handoff adopt list --cwd ${cwd}`
+          ? remoteHostHint
+            ? `\nSession ids are looked up on the bb server machine, but this thread runs on another machine — try: bb handoff adopt ${positionalQuery} --machine ${remoteHostHint}`
+            : `\nRun: bb handoff adopt list --cwd ${cwd}`
           : matchLines
             ? `\n${matchLines}`
             : "";

@@ -62,6 +62,7 @@ interface PrepStats {
   workspacePath: string | null;
   branchName: string | null;
   hasEnvironment: boolean;
+  sourceState: "idle" | "busy" | "blocked";
 }
 
 interface TargetProvider {
@@ -155,7 +156,8 @@ function formatBytes(bytes: number): string {
 
 /**
  * Roving radio-group keyboard support: arrow keys move the selection among
- * the enabled values and keep focus on the newly selected radio.
+ * the enabled values (Home/End jump to the ends) and keep focus on the newly
+ * selected radio.
  */
 function radioKeyNav(
   event: React.KeyboardEvent<HTMLElement>,
@@ -163,18 +165,23 @@ function radioKeyNav(
   current: string | null,
   select: (value: string) => void,
 ) {
-  const delta =
-    event.key === "ArrowRight" || event.key === "ArrowDown"
-      ? 1
-      : event.key === "ArrowLeft" || event.key === "ArrowUp"
-        ? -1
-        : 0;
-  if (delta === 0 || values.length === 0) return;
+  if (values.length === 0) return;
+  const index = current ? values.indexOf(current) : -1;
+  let nextIndex: number;
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+    nextIndex = (index + 1 + values.length) % values.length;
+  } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+    nextIndex = (index - 1 + values.length) % values.length;
+  } else if (event.key === "Home") {
+    nextIndex = 0;
+  } else if (event.key === "End") {
+    nextIndex = values.length - 1;
+  } else {
+    return;
+  }
   event.preventDefault();
   const container = event.currentTarget;
-  const index = current ? values.indexOf(current) : -1;
-  const next = values[(index + delta + values.length) % values.length]!;
-  select(next);
+  select(values[nextIndex]!);
   requestAnimationFrame(() => {
     container.querySelector<HTMLElement>('[role="radio"][aria-checked="true"]')?.focus();
   });
@@ -255,14 +262,13 @@ type ModelOption = {
   supportedReasoningEfforts: { reasoningEffort: ReasoningLevel; description: string }[];
 };
 
-/** Compact labels: the picker sits inline and the full names do not fit. */
 const EFFORT_LABELS: Record<ReasoningLevel, string> = {
   none: "None",
   low: "Low",
-  medium: "Med",
+  medium: "Medium",
   high: "High",
   xhigh: "X-high",
-  ultracode: "Ultra-c",
+  ultracode: "Ultracode",
   max: "Max",
   ultra: "Ultra",
 };
@@ -940,6 +946,14 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                   state, decisions, gotchas — that travels with the handoff. Skipped automatically
                   if it&apos;s busy; adds up to ~90s.
                 </span>
+                {briefing && stats && stats.sourceState !== "idle" ? (
+                  <span className="mt-0.5 flex items-start gap-1 text-xs leading-snug text-muted-foreground">
+                    <Icon name="AlertTriangle" className="mt-px size-3 shrink-0" aria-hidden />
+                    {stats.sourceState === "blocked"
+                      ? "The agent is waiting on an answer from you right now, so the briefing would be skipped."
+                      : "The agent is mid-turn right now, so the briefing would be skipped."}
+                  </span>
+                ) : null}
               </span>
               <span
                 aria-hidden

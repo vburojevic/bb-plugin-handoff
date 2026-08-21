@@ -18,17 +18,21 @@ export type { TransferPlan, WorkingState, WorkspaceMode } from "./machines";
 
 /**
  * Thinking effort for the target thread. Mirrors bb's `ReasoningLevel`, which
- * the SDK declares but does not export.
+ * the SDK declares but does not export. One list, shared by the rpc schema and
+ * both CLI surfaces, so a level cannot exist in one and be rejected by another.
  */
-export type ReasoningLevel =
-  | "none"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "ultracode"
-  | "max"
-  | "ultra";
+export const REASONING_LEVELS = [
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "ultracode",
+  "max",
+  "ultra",
+] as const;
+
+export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
 export interface HandoffRequest {
   sourceThreadId: string;
@@ -331,7 +335,7 @@ function renderWorkingState(
     `**It had uncommitted changes: ${working.files.length} file(s), +${working.insertions}/-${working.deletions}.** Those edits live on ${where} and are NOT present in your workspace unless you apply them.`,
     "",
     ...working.files.slice(0, 50).map((file) => `- \`${file.status}\` ${file.path}`),
-    working.files.length > 50 ? `- … and ${working.files.length - 50} more` : "",
+    ...(working.files.length > 50 ? [`- … and ${working.files.length - 50} more`] : []),
     "",
   );
   if (patchPath) {
@@ -351,7 +355,7 @@ function renderWorkingState(
       "",
     );
   }
-  return lines.filter((line) => line !== "").join("\n").concat("\n");
+  return lines.join("\n");
 }
 
 export function renderHandoff(

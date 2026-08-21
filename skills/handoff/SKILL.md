@@ -21,7 +21,9 @@ another enrolled machine, or adopt a session that lives on one.
 
 - `bb handoff --self --to <provider>` — hand off the current thread. Providers
   from `bb handoff targets` (e.g. `codex`, `claude-code`, `acp-opencode`).
-- `bb handoff <thread-id> --to <provider> [--model <model>] [--workspace reuse|worktree|personal] [--instructions <text>]`
+- `bb handoff <thread-id> --to <provider> [--model <model>] [--effort <level>] [--workspace reuse|worktree|personal] [--instructions <text>]`
+  — `--effort` sets the new thread's thinking effort (the levels a model
+  accepts vary per model; omit it to use the target model's own default).
 - `bb handoff <thread-id|--self> --to <provider> --up-to-seq <n>` — hand off
   only the context up to one chat message (its `sourceSeqEnd`); everything
   after that message is excluded from the handoff document. This is what the
@@ -55,7 +57,10 @@ another enrolled machine, or adopt a session that lives on one.
 
 - `bb handoff adopt` — adopt the newest external session for the current
   directory. Run it from inside a live terminal session and it adopts *that*
-  session.
+  session. Run from a bb thread on another enrolled machine, the
+  directory-based flows (bare adopt, `adopt list`, `--continue`) automatically
+  read *that* machine's session stores; a pasted session id is still looked up
+  on the bb server machine unless you add `--machine`.
 - `bb handoff adopt <id | resume command>` — paste a session id, an id prefix,
   or a whole resume command (`claude --resume <id>`, `codex resume <id>`); the
   id is located across every agent's session store, in any directory.
@@ -71,7 +76,7 @@ another enrolled machine, or adopt a session that lives on one.
   directory is a path on *this* machine.
 - Useful flags: `--dry-run` (plan only), `--force` (re-adopt a session already
   adopted), `--thread-provider <id>` (continue on a different bb provider),
-  `--json`.
+  `--effort <level>` (thinking effort for the new thread), `--json`.
 
 ## When to use
 

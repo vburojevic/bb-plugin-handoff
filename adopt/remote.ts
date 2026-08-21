@@ -91,7 +91,10 @@ export async function hostExec(
     if (terminalId) {
       await bb.sdk.terminals.close({ terminalId, mode: "force" }).catch(() => {});
     }
+    // On a timeout the redirect never got moved into place, so the `.part`
+    // file is the one that would otherwise be left behind.
     await bb.sdk.files.remove({ hostId, path: out }).catch(() => {});
+    await bb.sdk.files.remove({ hostId, path: `${out}.part` }).catch(() => {});
   }
 }
 

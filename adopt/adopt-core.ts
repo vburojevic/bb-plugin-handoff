@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { deriveHomeDir } from "../capture";
+import type { ReasoningLevel } from "../handoff";
 import { listMachines, matchMachine } from "../machines";
 import { ADAPTERS, getAdapter, resolveAgentId } from "./agents";
 import {
@@ -122,6 +123,8 @@ export interface AdoptOptions {
   title?: string;
   threadProviderId?: string;
   model?: string;
+  /** Thinking effort for the new thread; omit for the model's own default. */
+  reasoningLevel?: ReasoningLevel;
   maxChars?: number;
   force?: boolean;
   dryRun?: boolean;
@@ -402,6 +405,7 @@ async function adoptParsedSession(
     projectId: projectId!,
     providerId,
     model,
+    ...(options.reasoningLevel ? { reasoningLevel: options.reasoningLevel } : {}),
     title,
     environment: {
       type: "host",
@@ -523,6 +527,12 @@ export interface RemoteAdoptOptions extends AdoptFileOptions {
   machine: string;
   /** Session id, id prefix, or pasted resume command. Omit for the newest. */
   query?: string;
+  /**
+   * Exact session id from a prior listing — used verbatim, bypassing query
+   * parsing. Gemini's filename-derived ids contain characters the query
+   * grammar rejects, so a listed row must not round-trip through it.
+   */
+  sessionId?: string;
   /** The session's working directory on that machine. */
   cwd?: string | null;
   /** Override when no project source exists on that host to derive it from. */
@@ -659,7 +669,11 @@ export async function performAdoptRemote(
   }
   const ctx = resolved.ctx;
 
-  const parsed = options.query?.trim() ? parseAdoptQuery(options.query) : null;
+  const parsed: ParsedQuery | null = options.sessionId
+    ? { sessionId: options.sessionId, agentHint: null, newest: false }
+    : options.query?.trim()
+      ? parseAdoptQuery(options.query)
+      : null;
   const agentHint = parsed?.agentHint ?? (options.agent ? resolveAgentId(options.agent) : null);
   let matches: FoundSession[] = [];
 
@@ -772,11 +786,20 @@ export async function performAdoptRemote(
   }
 }
 
-/** Resolve the directory to look in for a project: its default source path. */
-export async function resolveProjectCwd(bb: BbPluginApi, projectId: string): Promise<string | null> {
+/**
+ * Resolve the directory to look in for a project: its default source path.
+ * With a hostId, only that machine's sources count — a default source on a
+ * different machine is a path that does not exist over there.
+ */
+export async function resolveProjectCwd(
+  bb: BbPluginApi,
+  projectId: string,
+  hostId?: string | null,
+): Promise<string | null> {
   const projects = await bb.sdk.projects.list({ includePersonal: true });
   const project = projects.find((p) => p.id === projectId);
   if (!project) return null;
-  const source = project.sources.find((s) => s.isDefault) ?? project.sources[0];
+  const pool = hostId ? project.sources.filter((s) => s.hostId === hostId) : project.sources;
+  const source = pool.find((s) => s.isDefault) ?? pool[0];
   return source?.path ?? null;
 }

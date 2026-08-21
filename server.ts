@@ -12,6 +12,7 @@ import { adoptRpcShape, createAdoptRpcHandlers } from "./adopt/rpc";
 import { captureThread } from "./capture";
 import {
   listHandoffs,
+  REASONING_LEVELS,
   renderHandoff,
   settleBriefing,
   settleVerification,
@@ -45,22 +46,12 @@ const BRIEFING_CLI_NOTE: Record<string, string> = {
 };
 
 /**
- * Thinking effort for the target thread. Mirrors bb's `ReasoningLevel`, which
- * the SDK declares but does not export. Never offer these blind: the levels a
+ * Thinking effort for the target thread. Never offer these blind: the levels a
  * model actually accepts differ per model, and `providers.models()` reports
  * them, so the picker is driven by `supportedReasoningEfforts` rather than by
  * this full set.
  */
-const reasoningLevelSchema = z.enum([
-  "none",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "ultracode",
-  "max",
-  "ultra",
-]);
+const reasoningLevelSchema = z.enum(REASONING_LEVELS);
 
 /** Event-seq cutoff of one chat message; scopes the capture to everything up to it. */
 const upToSeqField = z.number().int().positive().optional();
@@ -79,6 +70,11 @@ export const rpcContract = defineRpcContract({
       workspacePath: z.string().nullable(),
       branchName: z.string().nullable(),
       hasEnvironment: z.boolean(),
+      /**
+       * What the source agent is doing right now — the panel uses it to warn
+       * that a briefing would be skipped (it only runs against an idle thread).
+       */
+      sourceState: z.enum(["idle", "busy", "blocked"]),
     }),
   },
   listTargets: {
@@ -228,6 +224,17 @@ export default async function plugin(bb: BbPluginApi) {
     async prepareHandoff({ threadId, upToSeq }) {
       const captured = await captureThread(bb, threadId, { untilSeq: upToSeq });
       const doc = renderHandoff(captured, new Date());
+      // Same signals requestBriefing checks, so the panel's warning and the
+      // actual skip decision cannot drift apart.
+      let sourceState: "idle" | "busy" | "blocked" = "idle";
+      try {
+        // deno-lint-ignore no-explicit-any
+        const thread = (await bb.sdk.threads.get({ threadId })) as any;
+        if (thread.hasPendingInteraction) sourceState = "blocked";
+        else if (thread.status !== "idle") sourceState = "busy";
+      } catch {
+        // Unknown state reads as idle — the briefing itself re-checks anyway.
+      }
       return {
         title: captured.title,
         providerId: captured.providerId,
@@ -238,6 +245,7 @@ export default async function plugin(bb: BbPluginApi) {
         workspacePath: captured.workspacePath,
         branchName: captured.branchName,
         hasEnvironment: captured.environmentId != null,
+        sourceState,
       };
     },
     async listTargets({ threadId, machineId }) {
@@ -370,7 +378,7 @@ export default async function plugin(bb: BbPluginApi) {
       {
         name: "export",
         summary: "Write the handoff document to a file (for codex exec / claude -p outside bb)",
-        usage: "bb handoff export <thread-id|--self> [--out <path>]",
+        usage: "bb handoff export <thread-id|--self> [--out <path>] [--up-to-seq <n>]",
       },
       {
         name: "targets",
@@ -418,7 +426,7 @@ export default async function plugin(bb: BbPluginApi) {
           "             --machine runs the new thread on another enrolled machine. The source's",
           "             uncommitted work travels with it as a patch; reuse is same-machine only,",
           "             so pick checkout (that machine's project checkout), worktree, or personal.",
-          "  bb handoff export <thread-id|--self> [--out <path>]",
+          "  bb handoff export <thread-id|--self> [--out <path>] [--up-to-seq <n>]",
           "  bb handoff targets [--thread <thread-id>] [--machine <host>] [--json]",
           "  bb handoff list [--json]",
           "  bb handoff adopt …   (see `bb handoff adopt help`)",
@@ -432,11 +440,15 @@ export default async function plugin(bb: BbPluginApi) {
           return { exitCode: 0, stdout: `${JSON.stringify({ handoffs }, null, 2)}\n` };
         }
         if (handoffs.length === 0) return { exitCode: 0, stdout: "No handoffs recorded yet.\n" };
+        const VERIFICATION_MARK = { confirmed: "✓", failed: "✗", pending: "…" } as const;
         const lines = handoffs.map(
           (record) =>
-            `${new Date(record.at).toISOString()}  ${record.sourceThreadId} (${record.sourceProvider}) → ${record.targetThreadId} (${record.targetProvider}${record.model ? `/${record.model}` : ""}${record.reasoningLevel ? ` @${record.reasoningLevel}` : ""}, ${record.workspace}${record.targetMachine ? ` @ ${record.targetMachine}` : ""})`,
+            `${record.verification ? VERIFICATION_MARK[record.verification] : " "} ${new Date(record.at).toISOString()}  ${record.sourceThreadId} (${record.sourceProvider}) → ${record.targetThreadId} (${record.targetProvider}${record.model ? `/${record.model}` : ""}${record.reasoningLevel ? ` @${record.reasoningLevel}` : ""}, ${record.workspace}${record.targetMachine ? ` @ ${record.targetMachine}` : ""})`,
         );
-        return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
+        const legend = handoffs.some((record) => record.verification)
+          ? "\n✓ pickup confirmed · ✗ not confirmed · … first turn still pending"
+          : "";
+        return { exitCode: 0, stdout: `${lines.join("\n")}${legend}\n` };
       }
 
       if (command === "targets") {
@@ -451,9 +463,17 @@ export default async function plugin(bb: BbPluginApi) {
         }
         const environmentId =
           target || !threadId ? null : await environmentIdOfThread(bb, threadId);
-        const providers = await bb.sdk.providers.list(
+        // Bounded like the rpc path: asking a sleeping machine for its provider
+        // CLIs must not hold bb's event loop until that machine wakes up.
+        const providers = await listProvidersBounded(
+          bb,
           target ? { hostId: target.id } : environmentId ? { environmentId } : undefined,
         );
+        if (providers.length === 0 && target) {
+          return fail(
+            `Could not read the provider CLIs on ${target.name} — it did not answer in time. Is it awake and connected?`,
+          );
+        }
         if (flags.has("--json")) {
           const payload = providers.map((provider) => ({
             id: provider.id,
@@ -479,10 +499,17 @@ export default async function plugin(bb: BbPluginApi) {
         };
       }
 
+      // Shared by export and start: both can scope the capture to one message.
+      const upToSeqRaw = flags.get("--up-to-seq");
+      const upToSeq = upToSeqRaw ? Number.parseInt(upToSeqRaw, 10) : undefined;
+      if (upToSeqRaw && (!Number.isInteger(upToSeq) || upToSeq! <= 0)) {
+        return fail("--up-to-seq must be a positive integer (a message's sourceSeqEnd).");
+      }
+
       if (command === "export") {
         const threadId = resolveThreadId(positional[0]);
         if (!threadId) return fail("No thread. Pass a thread id or run with --self inside a bb thread.");
-        const captured = await captureThread(bb, threadId);
+        const captured = await captureThread(bb, threadId, { untilSeq: upToSeq });
         const doc = renderHandoff(captured, new Date());
         const out = flags.get("--out") ?? `handoff-${threadId}.md`;
         const absolute = out.startsWith("/") ? out : `${ctx.cwd ?? captured.workspacePath ?? "."}/${out}`;
@@ -511,11 +538,6 @@ export default async function plugin(bb: BbPluginApi) {
         const workspace = (flags.get("--workspace") ?? (machine ? "checkout" : "reuse")) as WorkspaceMode;
         if (!workspaceModeSchema.safeParse(workspace).success) {
           return fail("--workspace must be reuse, checkout, worktree, or personal.");
-        }
-        const upToSeqRaw = flags.get("--up-to-seq");
-        const upToSeq = upToSeqRaw ? Number.parseInt(upToSeqRaw, 10) : undefined;
-        if (upToSeqRaw && (!Number.isInteger(upToSeq) || upToSeq! <= 0)) {
-          return fail("--up-to-seq must be a positive integer (a message's sourceSeqEnd).");
         }
         const effortRaw = flags.get("--effort");
         const effort = effortRaw ? reasoningLevelSchema.safeParse(effortRaw) : null;
