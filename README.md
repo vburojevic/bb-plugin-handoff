@@ -243,3 +243,10 @@ bb plugin dev       # watch loop: rebuild + reload on save
 ## License
 
 [MIT](LICENSE) © Vedran Burojevic
+
+---
+
+## More bb plugins
+
+This is one of eight bb plugins I publish — see them all at
+[**vburojevic/bb-plugins**](https://github.com/vburojevic/bb-plugins).
