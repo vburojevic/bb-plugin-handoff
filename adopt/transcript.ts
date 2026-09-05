@@ -39,14 +39,14 @@ export interface AgentAdapter {
   label: string;
   /** Preferred bb provider for the continued thread. */
   bbProviderId: string;
-  list(cwd: string, home?: string): SessionSummary[];
+  list(cwd: string, home?: string): Promise<SessionSummary[]>;
   /**
    * Locate sessions by id or id prefix across ALL directories this agent has
    * sessions for. `cwdCandidates` helps agents whose session files don't
    * record a working directory (Gemini keys directories by hash).
    */
-  find(idOrPrefix: string, options?: { home?: string; cwdCandidates?: string[] }): FoundSession[];
-  parse(filePath: string, options?: { maxChars?: number }): ParsedSession;
+  find(idOrPrefix: string, options?: { home?: string; cwdCandidates?: string[] }): Promise<FoundSession[]>;
+  parse(filePath: string, options?: { maxChars?: number }): Promise<ParsedSession>;
 }
 
 export interface Block {
@@ -173,15 +173,15 @@ export class MtimeCache<T> {
 }
 
 /** Read the first `bytes` of a file as UTF-8 without loading the whole file. */
-export function readHead(filePath: string, bytes: number, fsModule: typeof import("node:fs")): string | null {
+export async function readHead(filePath: string, bytes: number, fsModule: typeof import("node:fs")): Promise<string | null> {
   try {
-    const fd = fsModule.openSync(filePath, "r");
+    const file = await fsModule.promises.open(filePath, "r");
     try {
-      const buf = new Uint8Array(bytes);
-      const read = fsModule.readSync(fd, buf, 0, buf.length, 0);
-      return Buffer.from(buf.subarray(0, read)).toString("utf8");
+      const buf = Buffer.alloc(bytes);
+      const { bytesRead } = await file.read(buf, 0, buf.length, 0);
+      return buf.subarray(0, bytesRead).toString("utf8");
     } finally {
-      fsModule.closeSync(fd);
+      await file.close();
     }
   } catch {
     return null;

@@ -209,7 +209,7 @@ export function createAdoptRpcHandlers(bb: BbPluginApi) {
         };
       }
       if (!target.remote) {
-        const collected = collectSessions(resolvedCwd);
+        const collected = await collectSessions(resolvedCwd);
         if ("error" in collected) return { cwd: resolvedCwd, sessions: [], error: collected.error };
         return {
           cwd: resolvedCwd,

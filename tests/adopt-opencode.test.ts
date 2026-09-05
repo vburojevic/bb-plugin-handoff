@@ -51,8 +51,8 @@ function seedFixture(): string {
 describe.skipIf(!hasSqlite3())("opencodeAdapter", () => {
   const dbPath = seedFixture();
 
-  it("lists sessions for a directory", () => {
-    const sessions = opencodeAdapter.list("/tmp/work/repo", home);
+  it("lists sessions for a directory", async () => {
+    const sessions = await opencodeAdapter.list("/tmp/work/repo", home);
     expect(sessions).toHaveLength(1);
     expect(sessions[0]).toMatchObject({
       agent: "opencode",
@@ -60,17 +60,17 @@ describe.skipIf(!hasSqlite3())("opencodeAdapter", () => {
       title: "Fix the flaky tests",
       filePath: `${dbPath}#ses_abc123`,
     });
-    expect(opencodeAdapter.list("/tmp/other", home)).toHaveLength(0);
+    expect(await opencodeAdapter.list("/tmp/other", home)).toHaveLength(0);
   });
 
-  it("finds by id prefix with the recovered cwd", () => {
-    const found = opencodeAdapter.find("ses_abc", { home });
+  it("finds by id prefix with the recovered cwd", async () => {
+    const found = await opencodeAdapter.find("ses_abc", { home });
     expect(found).toHaveLength(1);
     expect(found[0]!.cwd).toBe("/tmp/work/repo");
   });
 
-  it("parses the transcript with roles and tool calls", () => {
-    const session = opencodeAdapter.parse(`${dbPath}#ses_abc123`);
+  it("parses the transcript with roles and tool calls", async () => {
+    const session = await opencodeAdapter.parse(`${dbPath}#ses_abc123`);
     expect(session.sessionId).toBe("ses_abc123");
     expect(session.cwd).toBe("/tmp/work/repo");
     expect(session.userMessageCount).toBe(1);
@@ -81,8 +81,8 @@ describe.skipIf(!hasSqlite3())("opencodeAdapter", () => {
     expect(session.firstTimestamp).toBeTruthy();
   });
 
-  it("returns empty results when the db is absent", () => {
-    expect(opencodeAdapter.list("/tmp/work/repo", "/nonexistent-home")).toHaveLength(0);
-    expect(opencodeAdapter.find("ses_abc", { home: "/nonexistent-home" })).toHaveLength(0);
+  it("returns empty results when the db is absent", async () => {
+    expect(await opencodeAdapter.list("/tmp/work/repo", "/nonexistent-home")).toHaveLength(0);
+    expect(await opencodeAdapter.find("ses_abc", { home: "/nonexistent-home" })).toHaveLength(0);
   });
 });

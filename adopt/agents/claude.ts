@@ -22,8 +22,8 @@ function projectDir(cwd: string, home: string): string {
 }
 
 /** The session's cwd is recorded on its message rows. */
-function peekCwd(filePath: string): string | null {
-  const head = readHead(filePath, 256 * 1024, fs);
+async function peekCwd(filePath: string): Promise<string | null> {
+  const head = await readHead(filePath, 256 * 1024, fs);
   if (head === null) return null;
   for (const line of head.split("\n")) {
     const row = parseJsonLine(line);
@@ -49,8 +49,8 @@ function extractContent(content: unknown): { text: string; tools: string[] } {
   return { text: texts.join("\n\n"), tools };
 }
 
-function peekTitle(filePath: string): string | null {
-  const head = readHead(filePath, 64 * 1024, fs);
+async function peekTitle(filePath: string): Promise<string | null> {
+  const head = await readHead(filePath, 64 * 1024, fs);
   if (head === null) return null;
   let fallback: string | null = null;
   for (const line of head.split("\n")) {
@@ -65,24 +65,23 @@ function peekTitle(filePath: string): string | null {
   return fallback;
 }
 
-const titleCache = new MtimeCache<string | null>();
-const cwdCache = new MtimeCache<string | null>();
+const titleCache = new MtimeCache<Promise<string | null>>();
+const cwdCache = new MtimeCache<Promise<string | null>>();
 
 export const claudeAdapter: AgentAdapter = {
   id: "claude",
   label: "Claude Code",
   bbProviderId: "claude-code",
 
-  list(cwd: string, home: string = os.homedir()): SessionSummary[] {
+  async list(cwd: string, home: string = os.homedir()): Promise<SessionSummary[]> {
     const dir = projectDir(cwd, home);
-    if (!fs.existsSync(dir)) return [];
     const out: SessionSummary[] = [];
-    for (const entry of fs.readdirSync(dir)) {
+    for (const entry of await fs.promises.readdir(dir).catch(() => [])) {
       if (!entry.endsWith(".jsonl")) continue;
       const filePath = path.join(dir, entry);
       let stat: fs.Stats;
       try {
-        stat = fs.statSync(filePath);
+        stat = await fs.promises.stat(filePath);
       } catch {
         continue;
       }
@@ -93,24 +92,23 @@ export const claudeAdapter: AgentAdapter = {
         filePath,
         modifiedAtMs: stat.mtimeMs,
         sizeBytes: stat.size,
-        title: titleCache.get(filePath, stat.mtimeMs, () => peekTitle(filePath)),
+        title: await titleCache.get(filePath, stat.mtimeMs, () => peekTitle(filePath)),
       });
     }
     out.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
     return out;
   },
 
-  find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): FoundSession[] {
+  async find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): Promise<FoundSession[]> {
     const home = options.home ?? os.homedir();
     const root = path.join(home, ".claude", "projects");
-    if (!fs.existsSync(root)) return [];
     const needle = idOrPrefix.toLowerCase();
     const out: FoundSession[] = [];
-    for (const dir of fs.readdirSync(root)) {
+    for (const dir of await fs.promises.readdir(root).catch(() => [])) {
       const dirPath = path.join(root, dir);
       let entries: string[];
       try {
-        entries = fs.readdirSync(dirPath);
+        entries = await fs.promises.readdir(dirPath);
       } catch {
         continue;
       }
@@ -119,7 +117,7 @@ export const claudeAdapter: AgentAdapter = {
         const filePath = path.join(dirPath, entry);
         let stat: fs.Stats;
         try {
-          stat = fs.statSync(filePath);
+          stat = await fs.promises.stat(filePath);
         } catch {
           continue;
         }
@@ -130,8 +128,8 @@ export const claudeAdapter: AgentAdapter = {
           filePath,
           modifiedAtMs: stat.mtimeMs,
           sizeBytes: stat.size,
-          title: titleCache.get(filePath, stat.mtimeMs, () => peekTitle(filePath)),
-          cwd: cwdCache.get(filePath, stat.mtimeMs, () => peekCwd(filePath)),
+          title: await titleCache.get(filePath, stat.mtimeMs, () => peekTitle(filePath)),
+          cwd: await cwdCache.get(filePath, stat.mtimeMs, () => peekCwd(filePath)),
         });
       }
     }
@@ -139,8 +137,8 @@ export const claudeAdapter: AgentAdapter = {
     return out;
   },
 
-  parse(filePath: string, options: { maxChars?: number } = {}): ParsedSession {
-    return parseClaudeContent(fs.readFileSync(filePath, "utf8"), filePath, options);
+  async parse(filePath: string, options: { maxChars?: number } = {}): Promise<ParsedSession> {
+    return parseClaudeContent(await fs.promises.readFile(filePath, "utf8"), filePath, options);
   },
 };
 

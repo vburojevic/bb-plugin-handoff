@@ -24,14 +24,14 @@ function sessionsRoot(home: string): string {
   return path.join(home, ".codex", "sessions");
 }
 
-function walkJsonlFiles(dir: string): { filePath: string; mtimeMs: number; sizeBytes: number }[] {
+async function walkJsonlFiles(dir: string): Promise<{ filePath: string; mtimeMs: number; sizeBytes: number }[]> {
   const out: { filePath: string; mtimeMs: number; sizeBytes: number }[] = [];
   const stack = [dir];
   while (stack.length > 0) {
     const current = stack.pop()!;
     let entries: fs.Dirent[];
     try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
+      entries = await fs.promises.readdir(current, { withFileTypes: true });
     } catch {
       continue;
     }
@@ -40,7 +40,7 @@ function walkJsonlFiles(dir: string): { filePath: string; mtimeMs: number; sizeB
       if (entry.isDirectory()) stack.push(filePath);
       else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
         try {
-          const stat = fs.statSync(filePath);
+          const stat = await fs.promises.stat(filePath);
           if (stat.size > 0) out.push({ filePath, mtimeMs: stat.mtimeMs, sizeBytes: stat.size });
         } catch {
           // ignore files that vanish mid-scan
@@ -61,12 +61,12 @@ interface RolloutInfo {
 // The session_meta first line embeds the agent's full base instructions and
 // can be tens of KB — read generously so it and the first messages fit.
 const INFO_HEAD_BYTES = 512 * 1024;
-const infoCache = new MtimeCache<RolloutInfo>();
+const infoCache = new MtimeCache<Promise<RolloutInfo>>();
 
 /** One cached head-read per file: session_meta (id + cwd) and the title. */
-function readInfo(filePath: string, mtimeMs: number): RolloutInfo {
-  return infoCache.get(filePath, mtimeMs, () => {
-    const head = readHead(filePath, INFO_HEAD_BYTES, fs);
+async function readInfo(filePath: string, mtimeMs: number): Promise<RolloutInfo> {
+  return infoCache.get(filePath, mtimeMs, async () => {
+    const head = await readHead(filePath, INFO_HEAD_BYTES, fs);
     if (head === null) return { sessionId: null, cwd: null, title: null };
     const lines = head.split("\n");
     const info: RolloutInfo = { sessionId: null, cwd: null, title: null };
@@ -117,13 +117,12 @@ export const codexAdapter: AgentAdapter = {
   label: "Codex",
   bbProviderId: "codex",
 
-  list(cwd: string, home: string = os.homedir()): SessionSummary[] {
+  async list(cwd: string, home: string = os.homedir()): Promise<SessionSummary[]> {
     const root = sessionsRoot(home);
-    if (!fs.existsSync(root)) return [];
     const out: SessionSummary[] = [];
-    const files = walkJsonlFiles(root).slice(0, SCAN_LIMIT);
+    const files = (await walkJsonlFiles(root)).slice(0, SCAN_LIMIT);
     for (const file of files) {
-      const info = readInfo(file.filePath, file.mtimeMs);
+      const info = await readInfo(file.filePath, file.mtimeMs);
       if (info.cwd !== cwd || !info.sessionId) continue;
       out.push({
         agent: "codex",
@@ -137,17 +136,16 @@ export const codexAdapter: AgentAdapter = {
     return out;
   },
 
-  find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): FoundSession[] {
+  async find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): Promise<FoundSession[]> {
     const root = sessionsRoot(options.home ?? os.homedir());
-    if (!fs.existsSync(root)) return [];
     // Rollout filenames embed the session id: rollout-<timestamp>-<id>.jsonl
     const needle = idOrPrefix.toLowerCase();
     const out: FoundSession[] = [];
-    for (const file of walkJsonlFiles(root)) {
+    for (const file of await walkJsonlFiles(root)) {
       const base = path.basename(file.filePath, ".jsonl");
       const idPart = base.replace(/^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-/, "");
       if (!idPart.toLowerCase().startsWith(needle)) continue;
-      const info = readInfo(file.filePath, file.mtimeMs);
+      const info = await readInfo(file.filePath, file.mtimeMs);
       if (!info.sessionId) continue;
       out.push({
         agent: "codex",
@@ -162,8 +160,8 @@ export const codexAdapter: AgentAdapter = {
     return out;
   },
 
-  parse(filePath: string, options: { maxChars?: number } = {}): ParsedSession {
-    return parseCodexContent(fs.readFileSync(filePath, "utf8"), filePath, options);
+  async parse(filePath: string, options: { maxChars?: number } = {}): Promise<ParsedSession> {
+    return parseCodexContent(await fs.promises.readFile(filePath, "utf8"), filePath, options);
   },
 };
 

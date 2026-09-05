@@ -15,10 +15,10 @@ import {
 import type { AgentAdapter, AgentId, FoundSession, ParsedSession } from "./transcript";
 import type { SessionSummary } from "./transcript";
 
-export function collectSessions(
+export async function collectSessions(
   cwd: string,
   agentFilter?: string,
-): SessionSummary[] | { error: string } {
+): Promise<SessionSummary[] | { error: string }> {
   let adapters = ADAPTERS;
   if (agentFilter) {
     const id = resolveAgentId(agentFilter);
@@ -27,7 +27,7 @@ export function collectSessions(
     }
     adapters = [getAdapter(id)];
   }
-  const sessions = adapters.flatMap((adapter) => adapter.list(cwd));
+  const sessions = (await Promise.all(adapters.map((adapter) => adapter.list(cwd)))).flat();
   sessions.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
   return sessions;
 }
@@ -93,7 +93,7 @@ export async function locateSessions(
   for (const parent of parents) {
     let entries: fs.Dirent[] = [];
     try {
-      entries = fs.readdirSync(parent, { withFileTypes: true });
+      entries = await fs.promises.readdir(parent, { withFileTypes: true });
     } catch {
       continue;
     }
@@ -104,9 +104,9 @@ export async function locateSessions(
     }
   }
   const adapters = agentHint ? [getAdapter(agentHint)] : ADAPTERS;
-  const found = adapters.flatMap((adapter) =>
+  const found = (await Promise.all(adapters.map((adapter) =>
     adapter.find(sessionId, { cwdCandidates: [...cwdCandidates] }),
-  );
+  ))).flat();
   found.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
   return found;
 }
@@ -225,12 +225,12 @@ async function adoptFromFile(
 ): Promise<AdoptOutcome> {
   const adapter = getAdapter(agent);
   const maxChars = options.maxChars ?? 150_000;
-  const session = adapter.parse(filePath, {
+  const session = await adapter.parse(filePath, {
     maxChars: Number.isFinite(maxChars) && maxChars > 1000 ? maxChars : 150_000,
   });
   let lastActivityMs: number | null = null;
   try {
-    lastActivityMs = fs.statSync(filePath).mtimeMs;
+    lastActivityMs = (await fs.promises.stat(filePath)).mtimeMs;
   } catch {
     // Not a plain file path (e.g. a database-backed session) — fall through.
   }
@@ -428,7 +428,7 @@ export async function performAdopt(bb: BbPluginApi, options: AdoptOptions): Prom
   if (!fs.existsSync(cwd)) {
     return { ok: false, code: "bad-cwd", message: `Directory does not exist on the bb server machine: ${cwd}` };
   }
-  const collected = collectSessions(cwd, options.agent);
+  const collected = await collectSessions(cwd, options.agent);
   if ("error" in collected) return { ok: false, code: "bad-agent", message: collected.error };
   if (collected.length === 0) {
     return { ok: false, code: "no-sessions", message: `No agent sessions found for ${cwd}` };
@@ -621,7 +621,7 @@ export async function listRemoteSessionsForDirectory(
   const resolved = await resolveRemoteContext(bb, options.machine, options.home);
   if (!resolved.ok) return { error: resolved.outcome.message ?? "Unknown machine." };
   if (resolved.local) {
-    const collected = collectSessions(options.cwd, options.agent);
+    const collected = await collectSessions(options.cwd, options.agent);
     if ("error" in collected) return { error: collected.error };
     return {
       cwd: options.cwd,

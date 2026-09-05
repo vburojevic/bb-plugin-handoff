@@ -251,7 +251,7 @@ export async function runAdoptCli(
         stdout: `Sessions for ${listing.cwd} on ${listing.machine} (newest first):\n${lines.join("\n")}${listing.error ? `\n\n${listing.error}` : ""}\n\nAdopt one with: bb handoff adopt <session-id> --machine ${machine} --cwd ${listing.cwd}`,
       };
     }
-    const collected = collectSessions(cwd!, flags.values.get("agent"));
+    const collected = await collectSessions(cwd!, flags.values.get("agent"));
     if ("error" in collected) return { exitCode: 1, stderr: collected.error };
     const sessions = collected.slice(0, take);
     if (flags.booleans.has("json")) {

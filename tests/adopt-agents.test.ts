@@ -59,10 +59,10 @@ const claudeRows = [
 ];
 
 describe("claude adapter", () => {
-  it("lists sessions for a cwd with the ai title", () => {
+  it("lists sessions for a cwd with the ai title", async () => {
     const home = makeHome();
     writeClaudeSession(home, claudeRows);
-    const sessions = claudeAdapter.list(CWD, home);
+    const sessions = await claudeAdapter.list(CWD, home);
     expect(sessions).toHaveLength(1);
     expect(sessions[0]).toMatchObject({
       agent: "claude",
@@ -71,19 +71,19 @@ describe("claude adapter", () => {
     });
   });
 
-  it("finds sessions globally by id prefix and recovers the cwd", () => {
+  it("finds sessions globally by id prefix and recovers the cwd", async () => {
     const home = makeHome();
     writeClaudeSession(home, claudeRows);
-    const found = claudeAdapter.find("9ace2fd5", { home });
+    const found = await claudeAdapter.find("9ace2fd5", { home });
     expect(found).toHaveLength(1);
     expect(found[0]).toMatchObject({ sessionId: CLAUDE_ID, cwd: CWD });
-    expect(claudeAdapter.find("ffffffff", { home })).toHaveLength(0);
+    expect(await claudeAdapter.find("ffffffff", { home })).toHaveLength(0);
   });
 
-  it("parses the transcript, skipping meta rows and thinking blocks", () => {
+  it("parses the transcript, skipping meta rows and thinking blocks", async () => {
     const home = makeHome();
     const filePath = writeClaudeSession(home, claudeRows);
-    const session = claudeAdapter.parse(filePath);
+    const session = await claudeAdapter.parse(filePath);
     expect(session).toMatchObject({
       agent: "claude",
       sessionId: CLAUDE_ID,
@@ -150,31 +150,31 @@ function writeCodexSession(home: string): string {
 }
 
 describe("codex adapter", () => {
-  it("lists sessions by matching the session_meta cwd", () => {
+  it("lists sessions by matching the session_meta cwd", async () => {
     const home = makeHome();
     writeCodexSession(home);
-    const sessions = codexAdapter.list(CWD, home);
+    const sessions = await codexAdapter.list(CWD, home);
     expect(sessions).toHaveLength(1);
     expect(sessions[0]).toMatchObject({
       agent: "codex",
       sessionId: CODEX_ID,
       title: "refactor the parser", // injected <user_instructions> skipped
     });
-    expect(codexAdapter.list("/elsewhere", home)).toHaveLength(0);
+    expect(await codexAdapter.list("/elsewhere", home)).toHaveLength(0);
   });
 
-  it("finds sessions by filename id prefix with the recorded cwd", () => {
+  it("finds sessions by filename id prefix with the recorded cwd", async () => {
     const home = makeHome();
     writeCodexSession(home);
-    const found = codexAdapter.find("019fd95c", { home });
+    const found = await codexAdapter.find("019fd95c", { home });
     expect(found).toHaveLength(1);
     expect(found[0]).toMatchObject({ sessionId: CODEX_ID, cwd: CWD });
   });
 
-  it("parses messages and shell calls, skipping injected context", () => {
+  it("parses messages and shell calls, skipping injected context", async () => {
     const home = makeHome();
     const filePath = writeCodexSession(home);
-    const session = codexAdapter.parse(filePath);
+    const session = await codexAdapter.parse(filePath);
     expect(session).toMatchObject({
       agent: "codex",
       sessionId: CODEX_ID,
@@ -219,10 +219,10 @@ function writeGeminiSession(home: string): string {
 }
 
 describe("gemini adapter", () => {
-  it("lists sessions for a cwd via its hash directory", () => {
+  it("lists sessions for a cwd via its hash directory", async () => {
     const home = makeHome();
     writeGeminiSession(home);
-    const sessions = geminiAdapter.list(CWD, home);
+    const sessions = await geminiAdapter.list(CWD, home);
     expect(sessions).toHaveLength(1);
     expect(sessions[0]).toMatchObject({
       agent: "gemini",
@@ -231,20 +231,20 @@ describe("gemini adapter", () => {
     });
   });
 
-  it("finds sessions by id and reverses the cwd hash from candidates", () => {
+  it("finds sessions by id and reverses the cwd hash from candidates", async () => {
     const home = makeHome();
     writeGeminiSession(home);
-    const found = geminiAdapter.find("5c1f2f7a", { home, cwdCandidates: [CWD, "/other"] });
+    const found = await geminiAdapter.find("5c1f2f7a", { home, cwdCandidates: [CWD, "/other"] });
     expect(found).toHaveLength(1);
     expect(found[0]).toMatchObject({ sessionId: GEMINI_ID, cwd: CWD });
-    const withoutCandidates = geminiAdapter.find("5c1f2f7a", { home });
+    const withoutCandidates = await geminiAdapter.find("5c1f2f7a", { home });
     expect(withoutCandidates[0]!.cwd).toBeNull();
   });
 
-  it("parses messages and tool calls", () => {
+  it("parses messages and tool calls", async () => {
     const home = makeHome();
     const filePath = writeGeminiSession(home);
-    const session = geminiAdapter.parse(filePath);
+    const session = await geminiAdapter.parse(filePath);
     expect(session).toMatchObject({
       agent: "gemini",
       sessionId: GEMINI_ID,

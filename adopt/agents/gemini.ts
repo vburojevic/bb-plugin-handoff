@@ -34,9 +34,9 @@ interface GeminiSessionFile {
   messages?: unknown;
 }
 
-function readSessionFile(filePath: string): GeminiSessionFile | null {
+async function readSessionFile(filePath: string): Promise<GeminiSessionFile | null> {
   try {
-    const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const value = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
     return typeof value === "object" && value !== null ? (value as GeminiSessionFile) : null;
   } catch {
     return null;
@@ -54,14 +54,14 @@ function firstUserSnippet(data: GeminiSessionFile): string | null {
 }
 
 /** Discovery needs only id + title; cache them so list/find skip re-parsing. */
-const summaryCache = new MtimeCache<{ sessionId: string | null; title: string | null } | null>();
+const summaryCache = new MtimeCache<Promise<{ sessionId: string | null; title: string | null } | null>>();
 
-function readSummary(
+async function readSummary(
   filePath: string,
   mtimeMs: number,
-): { sessionId: string | null; title: string | null } | null {
-  return summaryCache.get(filePath, mtimeMs, () => {
-    const data = readSessionFile(filePath);
+): Promise<{ sessionId: string | null; title: string | null } | null> {
+  return summaryCache.get(filePath, mtimeMs, async () => {
+    const data = await readSessionFile(filePath);
     if (!data) return null;
     return {
       sessionId: typeof data.sessionId === "string" ? data.sessionId : null,
@@ -77,21 +77,20 @@ export const geminiAdapter: AgentAdapter = {
   // overridden with --thread-provider.
   bbProviderId: "claude-code",
 
-  list(cwd: string, home: string = os.homedir()): SessionSummary[] {
+  async list(cwd: string, home: string = os.homedir()): Promise<SessionSummary[]> {
     const dir = chatsDir(cwd, home);
-    if (!fs.existsSync(dir)) return [];
     const out: SessionSummary[] = [];
-    for (const entry of fs.readdirSync(dir)) {
+    for (const entry of await fs.promises.readdir(dir).catch(() => [])) {
       if (!entry.startsWith("session-") || !entry.endsWith(".json")) continue;
       const filePath = path.join(dir, entry);
       let stat: fs.Stats;
       try {
-        stat = fs.statSync(filePath);
+        stat = await fs.promises.stat(filePath);
       } catch {
         continue;
       }
       if (!stat.isFile() || stat.size === 0) continue;
-      const summary = readSummary(filePath, stat.mtimeMs);
+      const summary = await readSummary(filePath, stat.mtimeMs);
       if (!summary) continue;
       out.push({
         agent: "gemini",
@@ -106,10 +105,9 @@ export const geminiAdapter: AgentAdapter = {
     return out;
   },
 
-  find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): FoundSession[] {
+  async find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): Promise<FoundSession[]> {
     const home = options.home ?? os.homedir();
     const tmpRoot = path.join(home, ".gemini", "tmp");
-    if (!fs.existsSync(tmpRoot)) return [];
     // Session files don't record a cwd; the parent directory is sha256(cwd),
     // so recover it by hashing candidate directories.
     const hashToCwd = new Map<string, string>();
@@ -118,12 +116,11 @@ export const geminiAdapter: AgentAdapter = {
     }
     const needle = idOrPrefix.toLowerCase();
     const out: FoundSession[] = [];
-    for (const hashDir of fs.readdirSync(tmpRoot)) {
+    for (const hashDir of await fs.promises.readdir(tmpRoot).catch(() => [])) {
       const dir = path.join(tmpRoot, hashDir, "chats");
-      if (!fs.existsSync(dir)) continue;
       let entries: string[];
       try {
-        entries = fs.readdirSync(dir);
+        entries = await fs.promises.readdir(dir);
       } catch {
         continue;
       }
@@ -132,11 +129,11 @@ export const geminiAdapter: AgentAdapter = {
         const filePath = path.join(dir, entry);
         let stat: fs.Stats;
         try {
-          stat = fs.statSync(filePath);
+          stat = await fs.promises.stat(filePath);
         } catch {
           continue;
         }
-        const summary = readSummary(filePath, stat.mtimeMs);
+        const summary = await readSummary(filePath, stat.mtimeMs);
         if (!summary?.sessionId) continue;
         if (!summary.sessionId.toLowerCase().startsWith(needle)) continue;
         out.push({
@@ -154,8 +151,8 @@ export const geminiAdapter: AgentAdapter = {
     return out;
   },
 
-  parse(filePath: string, options: { maxChars?: number } = {}): ParsedSession {
-    const data = readSessionFile(filePath);
+  async parse(filePath: string, options: { maxChars?: number } = {}): Promise<ParsedSession> {
+    const data = await readSessionFile(filePath);
     if (!data) throw new Error(`Not a Gemini CLI session file: ${filePath}`);
     return parseGeminiData(data, filePath, options);
   },

@@ -126,12 +126,12 @@ describe("readHead", () => {
     for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("reads only the first bytes of a file", () => {
+  it("reads only the first bytes of a file", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adopt-test-"));
     dirs.push(dir);
     const file = path.join(dir, "big.txt");
     fs.writeFileSync(file, `head${"z".repeat(100)}`);
-    expect(readHead(file, 4, fs)).toBe("head");
-    expect(readHead(path.join(dir, "missing.txt"), 4, fs)).toBeNull();
+    expect(await readHead(file, 4, fs)).toBe("head");
+    expect(await readHead(path.join(dir, "missing.txt"), 4, fs)).toBeNull();
   });
 });

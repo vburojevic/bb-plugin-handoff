@@ -4,8 +4,10 @@
 // read via the system `sqlite3` CLI in -readonly -json mode, so the plugin
 // needs no native sqlite binding of its own. filePath for this adapter is
 // "<db-path>#<session-id>".
-import { execFileSync } from "node:child_process";
-import * as fs from "node:fs";
+import { execFile } from "node:child_process";
+import { access } from "node:fs/promises";
+import { promisify } from "node:util";
+const execFileAsync = promisify(execFile);
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -37,10 +39,10 @@ function isInjectedUserText(text: string): boolean {
 }
 
 /** Run a read-only query; returns [] when sqlite3 or the db is unavailable. */
-function query(dbPath: string, sql: string): Record<string, unknown>[] {
-  if (!fs.existsSync(dbPath)) return [];
+async function query(dbPath: string, sql: string): Promise<Record<string, unknown>[]> {
   try {
-    const stdout = execFileSync("sqlite3", ["-readonly", "-json", dbPath, sql], {
+    await access(dbPath);
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, sql], {
       encoding: "utf8",
       timeout: 10_000,
       maxBuffer: 64 * 1024 * 1024,
@@ -107,29 +109,30 @@ export const opencodeAdapter: AgentAdapter = {
   label: "OpenCode",
   bbProviderId: "acp-opencode",
 
-  list(cwd: string, home: string = os.homedir()): SessionSummary[] {
+  async list(cwd: string, home: string = os.homedir()): Promise<SessionSummary[]> {
     const dbPath = opencodeDbPath(home);
-    const rows = query(dbPath, opencodeListSql(cwd)) as unknown as SessionRow[];
+    const rows = await query(dbPath, opencodeListSql(cwd)) as unknown as SessionRow[];
     return rows.map((row) => toSummary(dbPath, row));
   },
 
-  find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): FoundSession[] {
+  async find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): Promise<FoundSession[]> {
     const dbPath = opencodeDbPath(options.home ?? os.homedir());
-    const rows = query(dbPath, opencodeFindSql(idOrPrefix)) as unknown as SessionRow[];
+    const rows = await query(dbPath, opencodeFindSql(idOrPrefix)) as unknown as SessionRow[];
     return rows.map((row) => ({ ...toSummary(dbPath, row), cwd: row.directory ?? null }));
   },
 
-  parse(filePath: string, options: { maxChars?: number } = {}): ParsedSession {
+  async parse(filePath: string, options: { maxChars?: number } = {}): Promise<ParsedSession> {
     const separator = filePath.lastIndexOf("#");
     const dbPath = separator === -1 ? filePath : filePath.slice(0, separator);
     const sessionId = separator === -1 ? "" : filePath.slice(separator + 1);
     const sql = opencodeSql(sessionId);
 
-    const sessionRows = query(dbPath, sql.session) as unknown as SessionRow[];
+    const sessionRows = await query(dbPath, sql.session) as unknown as SessionRow[];
     const session = sessionRows[0];
     if (!session) throw new Error(`No OpenCode session ${sessionId} in ${dbPath}`);
+    const [messages, parts] = await Promise.all([query(dbPath, sql.messages), query(dbPath, sql.parts)]);
     return parseOpencodeRows(
-      { session, messages: query(dbPath, sql.messages), parts: query(dbPath, sql.parts) },
+      { session, messages, parts },
       filePath,
       options,
     );
