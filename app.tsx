@@ -201,12 +201,14 @@ function timeAgo(at: number): string {
 }
 
 function ProviderMark({ provider, className }: { provider: TargetProvider; className?: string }) {
+  // `<img>` logos are isolated documents where SVG `currentColor` is black —
+  // invisible on dark. A fixed white tile keeps every mark legible in both themes without recoloring brand logos.
   if (provider.logoUrl) {
     return (
       <img
         src={provider.logoUrl}
         alt=""
-        className={cn("shrink-0 rounded-md border border-border bg-background object-contain p-1", className)}
+        className={cn("shrink-0 rounded-md border border-border bg-white object-contain p-1", className)}
       />
     );
   }
@@ -614,10 +616,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
               <div className="flex items-center gap-2" aria-label="Handoff route">
                 <RouteChip>
                   {sourceProvider ? (
-                    <ProviderMark
-                      provider={sourceProvider}
-                      className="size-3.5 rounded-sm border-0 bg-transparent p-0"
-                    />
+                    <ProviderMark provider={sourceProvider} className="size-3.5 rounded-sm border-0 p-0" />
                   ) : (
                     <Icon name="MessageSquare" className="size-3 text-muted-foreground" aria-hidden />
                   )}
@@ -626,7 +625,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                 <Icon name="ArrowRight" className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
                 {selectedProvider ? (
                   <RouteChip key={selectedProvider.id} animateIn>
-                    <ProviderMark provider={selectedProvider} className="size-3.5 rounded-sm border-0 bg-transparent p-0" />
+                    <ProviderMark provider={selectedProvider} className="size-3.5 rounded-sm border-0 p-0" />
                     {selectedProvider.displayName}
                   </RouteChip>
                 ) : (
