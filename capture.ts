@@ -311,7 +311,8 @@ export interface CaptureOptions {
   untilSeq?: number;
 }
 
-const EVENT_PAGE_SIZE = 1000;
+// bb caps threads.events.list at 100 ("Thread event limit cannot exceed 100").
+const EVENT_PAGE_SIZE = 100;
 
 export async function captureThread(
   bb: BbPluginApi,
