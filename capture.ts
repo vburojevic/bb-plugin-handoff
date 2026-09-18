@@ -311,7 +311,7 @@ export interface CaptureOptions {
   untilSeq?: number;
 }
 
-const EVENT_PAGE_SIZE = 1000;
+const EVENT_PAGE_SIZE = 100;
 
 export async function captureThread(
   bb: BbPluginApi,

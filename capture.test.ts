@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CAPS,
+  captureThread,
   claudeProjectSlug,
   clip,
   deriveHomeDir,
@@ -9,6 +10,7 @@ import {
 } from "./capture";
 import { fitTranscript, renderHandoff } from "./handoff";
 import type { CapturedSession } from "./capture";
+import type { BbPluginApi } from "@bb/plugin-sdk";
 
 function claudeStyleEvents(): EventRowLike[] {
   return [
@@ -134,6 +136,49 @@ describe("projectEvents", () => {
     ]);
     expect(entries[0]!.body.length).toBeLessThan(CAPS.commandOutput + 200);
     expect(entries[0]!.body).toContain("truncated");
+  });
+});
+
+describe("captureThread", () => {
+  it("pages within the server's 100-event request limit", async () => {
+    const events = Array.from({ length: 205 }, (_, index) => ({
+      seq: index + 1,
+      type: "provider/unhandled",
+      data: {},
+    }));
+    const requests: Array<{ afterSeq?: string; limit: string }> = [];
+    const bb = {
+      sdk: {
+        threads: {
+          get: async () => ({
+            id: "thr_1",
+            title: "Long thread",
+            providerId: "codex",
+            projectId: "proj_1",
+            environmentId: null,
+          }),
+          events: {
+            list: async ({ afterSeq, limit }: { afterSeq?: string; limit: string }) => {
+              requests.push({ afterSeq, limit });
+              const pageSize = Number(limit);
+              if (pageSize > 100) throw new Error("Thread event limit cannot exceed 100");
+              const start = afterSeq === undefined ? 0 : Number(afterSeq);
+              return events.slice(start, start + pageSize);
+            },
+          },
+          output: async () => ({ output: "Done." }),
+        },
+      },
+    } as unknown as BbPluginApi;
+
+    const captured = await captureThread(bb, "thr_1");
+
+    expect(captured.eventCount).toBe(205);
+    expect(requests).toEqual([
+      { afterSeq: undefined, limit: "100" },
+      { afterSeq: "100", limit: "100" },
+      { afterSeq: "200", limit: "100" },
+    ]);
   });
 });
 
