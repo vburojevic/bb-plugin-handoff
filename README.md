@@ -130,6 +130,10 @@ codex resume 019fd95c-907f-7eb1-8dfc-2aad427ffc09
 | Gemini CLI  | `~/.gemini/tmp/<sha256(cwd)>/chats/*.json`     | `claude-code` (no bb Gemini provider) |
 | OpenCode    | `~/.local/share/opencode/opencode.db` (SQLite) | `acp-opencode`                        |
 
+- Claude Code's store moves with `CLAUDE_CONFIG_DIR`. Adoption reads the
+  configured directory, the default `~/.claude`, and any sibling profile
+  directory (`~/.claude-work`, `~/.claude-personal`), so sessions started
+  under a non-default profile are adoptable too.
 - The new thread starts **in the session's own directory**, so the files are
   exactly where you left them.
 - The transcript rides along as agent-only context: your bb timeline stays
