@@ -34,6 +34,19 @@ describe("parseAdoptQuery", () => {
     });
   });
 
+  it("parses Pi resume/session commands and custom session ids", () => {
+    for (const command of [`pi --resume ${UUID}`, `pi -r ${UUID}`, `pi --session ${UUID}`]) {
+      expect(parseAdoptQuery(command)).toEqual({ sessionId: UUID, agentHint: "pi", newest: false });
+    }
+    expect(parseAdoptQuery("pi --session parser-repair")).toEqual({
+      sessionId: "parser-repair", agentHint: "pi", newest: false,
+    });
+    expect(parseAdoptQuery("pi --continue")).toEqual({
+      sessionId: null, agentHint: "pi", newest: true,
+    });
+    expect(parseAdoptQuery("pi -c")).toMatchObject({ agentHint: "pi", newest: true });
+  });
+
   it("treats continue/last flags as newest-session requests", () => {
     expect(parseAdoptQuery("claude --continue")).toEqual({
       sessionId: null,
