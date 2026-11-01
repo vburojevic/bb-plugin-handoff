@@ -259,7 +259,7 @@ export async function findNativeSessionPath(
   const target = nativeSessionTarget(providerId, home, workspacePath, providerThreadId);
   if (!target) return null;
   try {
-    const listing = await bb.sdk.files.list({ hostId, path: target.dir, query: providerThreadId, limit: 100 });
+    const listing = await bb.sdk.files.list({ hostId, path: target.dir, query: target.query, limit: 100 });
     const hit = listing.files.find((file) => target.matches(file.path));
     return hit ? `${target.dir}/${hit.path}` : null;
   } catch {
@@ -272,11 +272,14 @@ function nativeSessionTarget(
   home: string,
   workspacePath: string,
   sessionId: string,
-): { dir: string; matches: (relativePath: string) => boolean } | null {
+): { dir: string; query: string; matches: (relativePath: string) => boolean } | null {
   if (providerId === "claude-code") {
     // <projects>/<cwd-slug>/<session-id>.jsonl, directly in the project dir.
+    // Query the full file name: with the bare id, a session with 100 or more
+    // subagent transcripts pushes the main file out of the listing.
     return {
       dir: `${home}/.claude/projects/${claudeProjectSlug(workspacePath)}`,
+      query: `${sessionId}.jsonl`,
       matches: (relativePath) => relativePath === `${sessionId}.jsonl`,
     };
   }
@@ -284,6 +287,7 @@ function nativeSessionTarget(
     // <sessions>/YYYY/MM/DD/rollout-<timestamp>-<session-id>.jsonl
     return {
       dir: `${home}/.codex/sessions`,
+      query: sessionId,
       matches: (relativePath) => {
         const base = relativePath.slice(relativePath.lastIndexOf("/") + 1);
         return base.startsWith("rollout-") && base.endsWith(`-${sessionId}.jsonl`);

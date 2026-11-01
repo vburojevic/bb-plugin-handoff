@@ -249,6 +249,26 @@ describe("findNativeSessionPath", () => {
     );
   });
 
+  it("finds the Claude Code main transcript past 100 subagent transcripts", async () => {
+    type ListFiles = BbPluginApi["sdk"]["files"]["list"];
+    const paths = [
+      ...Array.from({ length: 100 }, (_, index) => `abc-123/subagents/agent-a${index}.jsonl`),
+      "abc-123.jsonl",
+    ];
+    // Like bb's listing: paths containing the query, subagents ranked first, capped at the limit.
+    const list = vi.fn<ListFiles>(async ({ query, limit }) => ({
+      files: paths
+        .filter((path) => path.includes(query ?? ""))
+        .slice(0, limit)
+        .map((path) => ({ name: path.slice(path.lastIndexOf("/") + 1), path })),
+      truncated: false,
+    }));
+    const bb = { sdk: { files: { list } } } as unknown as BbPluginApi;
+    expect(await findNativeSessionPath(bb, query("claude-code"))).toBe(
+      "/Users/dev/.claude/projects/-Users-dev-work/abc-123.jsonl",
+    );
+  });
+
   it("returns null when only subagent transcripts match", async () => {
     const { bb } = api(["abc-123/subagents/agent-a1.jsonl"]);
     expect(await findNativeSessionPath(bb, query("claude-code"))).toBeNull();
