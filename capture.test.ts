@@ -96,7 +96,7 @@ describe("projectEvents", () => {
     ]);
     const user = entries[0]!;
     expect(user.body).toContain("Please fix the login bug");
-    expect(user.body).toContain("[attached file: spec.md]");
+    expect(user.body).toContain("[attached file reference: spec.md]");
     const tool = entries[1]!;
     expect(tool.title).toBe("Read");
     expect(tool.body).toContain("const login");
@@ -197,6 +197,14 @@ describe("renderHandoff", () => {
 });
 
 describe("fitTranscript", () => {
+  it("enforces bytes for multibyte text and retains priority user requirements", () => {
+    const blocks = ["🙂".repeat(300), "start", "middle user requirement", "Ж".repeat(300), "recent"];
+    const text = fitTranscript(blocks, 220, [2]);
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(220);
+    expect(text).toContain("middle user requirement");
+    expect(text).toContain("recent");
+    expect(text).toContain("omitted");
+  });
   it("returns everything when under budget", () => {
     expect(fitTranscript(["a", "b"], 1000)).toBe("a\n\n---\n\nb");
   });

@@ -135,12 +135,13 @@ function makeFakeBb(
         attachments: {
           upload: async (args: unknown) => {
             record("attachments.upload", args);
+            const input = args as { filename: string; clientFile: Uint8Array; mimeType: string };
             return {
               type: "localFile",
-              path: "attachments/handoff.md",
-              name: "handoff.md",
-              sizeBytes: 1234,
-              mimeType: "text/markdown",
+              path: `attachments/${input.filename}`,
+              name: input.filename,
+              sizeBytes: input.clientFile.byteLength,
+              mimeType: input.mimeType,
             };
           },
         },
@@ -184,12 +185,22 @@ describe("startHandoff", () => {
     };
     expect(spawn.providerId).toBe("codex");
     expect(spawn.model).toBe("gpt-5.6-sol");
+    expect(spawn).toMatchObject({ executionInputSources: { providerId: "explicit", model: "explicit" } });
+    expect(spawn).not.toHaveProperty("lifecycleOwnerThreadId");
+    expect(spawn).not.toHaveProperty("parentThreadId");
+    const uploads = calls.filter(call => call.method === "attachments.upload");
+    expect(uploads).toHaveLength(2);
+    const archive = uploads[1]!.args as { clientFile: Uint8Array; filename: string };
+    expect(archive.filename).toMatch(/events-001\.jsonl$/);
+    expect(new TextDecoder().decode(archive.clientFile)).toContain("Build the feature");
+    expect(spawn.input).toHaveLength(3);
     expect(spawn.environment).toEqual({ type: "reuse", environmentId: "env_1" });
     expect(spawn.title).toBe("Handoff: Build feature X");
     expect(spawn.input[0]!.type).toBe("text");
     expect(spawn.input[0]!.text).toContain("handed off from claude-code");
     expect(spawn.input[0]!.text).toContain("Prefer small commits.");
-    expect(spawn.input[1]).toMatchObject({ type: "localFile", path: "attachments/handoff.md" });
+    expect(spawn.input[1]).toMatchObject({ type: "localFile", path: expect.stringMatching(/^attachments\/handoff-thr_src-\d+\.md$/) });
+    expect(spawn.input[2]!.path).not.toBe(spawn.input[1]!.path);
 
     const historyKeys = [...kv.keys()].filter((key) => key.startsWith("handoff:"));
     expect(historyKeys).toHaveLength(1);
@@ -249,6 +260,7 @@ describe("startHandoff", () => {
       providerId: "codex",
       workspace: "reuse",
       untilSeq: 2,
+      briefing: true,
     });
 
     const upload = calls.find((call) => call.method === "attachments.upload")!.args as {
@@ -259,20 +271,23 @@ describe("startHandoff", () => {
     expect(doc).toContain("partial capture");
     expect(doc).not.toContain("Done with step one.");
     expect(doc).not.toContain("Step one done.");
+    expect(calls.some(call => call.method === "threads.send")).toBe(false);
+    const archive = calls.filter(call => call.method === "attachments.upload")[1]!.args as { clientFile: Uint8Array };
+    expect(new TextDecoder().decode(archive.clientFile)).not.toContain("Done with step one.");
 
     const spawn = calls.find((call) => call.method === "threads.spawn")!.args as { title: string };
     expect(spawn.title).toBe("Handoff from message: Build feature X");
   });
 
-  it("tells the next agent how to reach the source thread", async () => {
+  it("keeps source history reachable without waking the original agent", async () => {
     const { bb, calls } = makeFakeBb();
     await startHandoff(bb, { sourceThreadId: "thr_src", providerId: "codex", workspace: "reuse" });
     const upload = calls.find((call) => call.method === "attachments.upload")!.args as {
       clientFile: Uint8Array;
     };
     const doc = new TextDecoder().decode(upload.clientFile);
-    expect(doc).toContain('bb thread tell thr_src "<your question>" --mode queue');
-    expect(doc).toContain("bb thread output thr_src");
+    expect(doc).toContain("The source thread is `thr_src`");
+    expect(doc).toContain("Do not wake or message the source agent");
   });
 
   it("with briefing, asks the idle source agent and embeds its answer", async () => {

@@ -228,6 +228,26 @@ lookup, `parse(file)` for transcript blocks — and registering it in
 
 ## Development
 
+### Capturing conversation history
+
+Handoff pages through BB events in batches of 100 and preserves the available
+event objects in JSONL attachments. Export writes these files beside the Markdown
+document. Keep the document and archive together: the readable transcript has a
+byte budget and may omit excerpts, while the archive preserves the captured data.
+
+Accepted inputs are reconstructed from BB request/acceptance events. Rejected,
+unconfirmed and agent-origin requests are labelled separately. Matching provider
+echoes are deduplicated per request; repeated user messages remain separate.
+The readable document prioritizes user requirements when space is limited.
+
+Partial captures do not request a later briefing or link an unscoped native log.
+A successful first reply confirms delivery, not understanding. Original attachment
+bytes and provider-hidden state are not copied into the event archive.
+
+The successor remains independent: archiving or deleting the source does not
+archive or delete the continuation. The source agent is not woken automatically.
+This change is checked against BB 0.46.1; older API compatibility is not claimed.
+
 ```sh
 npm install
 npm test            # 122 unit tests: capture/render, transfer planning,

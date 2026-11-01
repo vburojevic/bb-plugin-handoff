@@ -1021,13 +1021,13 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
                         <Icon
                           name="CircleCheck"
                           className="size-3 shrink-0 text-primary"
-                          aria-label="The receiving agent confirmed the pickup"
+                          aria-label="First reply received; context comprehension has not been verified"
                         />
                       ) : row.verification === "failed" ? (
                         <Icon
                           name="AlertTriangle"
                           className="size-3 shrink-0 text-destructive"
-                          aria-label="The receiving thread may not have picked up the context"
+                          aria-label="The receiving thread failed or returned no answer"
                         />
                       ) : null}
                     </span>
@@ -1113,7 +1113,7 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
               <DialogTitle>Handoff document</DialogTitle>
               <DialogDescription>
                 {preview
-                  ? `${formatBytes(preview.docBytes)} — exactly what the next agent receives${preview.truncated ? " (preview shortened)" : ""}`
+                  ? `${formatBytes(preview.docBytes)} — transcript preview; delivery adds the event archive and any briefing${preview.truncated ? " (preview shortened)" : ""}`
                   : "Rendering the document…"}
               </DialogDescription>
             </DialogHeader>

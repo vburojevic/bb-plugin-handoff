@@ -10,6 +10,7 @@ import { z } from "zod";
 import { adoptCommandSpecs, runAdoptCli } from "./adopt/cli";
 import { adoptRpcShape, createAdoptRpcHandlers } from "./adopt/rpc";
 import { captureThread } from "./capture";
+import { buildEventArchive, fidelitySummary } from "./archive";
 import {
   listHandoffs,
   REASONING_LEVELS,
@@ -446,7 +447,7 @@ export default async function plugin(bb: BbPluginApi) {
             `${record.verification ? VERIFICATION_MARK[record.verification] : " "} ${new Date(record.at).toISOString()}  ${record.sourceThreadId} (${record.sourceProvider}) → ${record.targetThreadId} (${record.targetProvider}${record.model ? `/${record.model}` : ""}${record.reasoningLevel ? ` @${record.reasoningLevel}` : ""}, ${record.workspace}${record.targetMachine ? ` @ ${record.targetMachine}` : ""})`,
         );
         const legend = handoffs.some((record) => record.verification)
-          ? "\n✓ pickup confirmed · ✗ not confirmed · … first turn still pending"
+          ? "\n✓ first reply received (context comprehension not verified) · ✗ first turn failed/empty · … first turn still pending"
           : "";
         return { exitCode: 0, stdout: `${lines.join("\n")}${legend}\n` };
       }
@@ -510,7 +511,8 @@ export default async function plugin(bb: BbPluginApi) {
         const threadId = resolveThreadId(positional[0]);
         if (!threadId) return fail("No thread. Pass a thread id or run with --self inside a bb thread.");
         const captured = await captureThread(bb, threadId, { untilSeq: upToSeq });
-        const doc = renderHandoff(captured, new Date());
+        const archiveParts = buildEventArchive(captured);
+        const doc = renderHandoff(captured, new Date(), null, { archiveParts });
         const out = flags.get("--out") ?? `handoff-${threadId}.md`;
         const absolute = out.startsWith("/") ? out : `${ctx.cwd ?? captured.workspacePath ?? "."}/${out}`;
         // Multi-machine rule: write on the invoking thread's host when known,
@@ -520,11 +522,17 @@ export default async function plugin(bb: BbPluginApi) {
           const environmentId = await environmentIdOfThread(bb, ctx.threadId);
           if (environmentId) hostId = (await bb.sdk.environments.get({ environmentId })).hostId;
         }
+        const directory = absolute.slice(0, absolute.lastIndexOf("/"));
+        for (const part of archiveParts) {
+          const saved = await bb.sdk.files.write({ hostId, path: `${directory}/${part.name}`,
+            content: new TextDecoder().decode(part.bytes), createParents: true });
+          if (saved.outcome !== "written") return fail(`Could not write archive ${part.name}: ${saved.outcome}`);
+        }
         const written = await bb.sdk.files.write({ hostId, path: absolute, content: doc, createParents: true });
         if (written.outcome !== "written") return fail(`Could not write ${absolute}: ${written.outcome}`);
         return {
           exitCode: 0,
-          stdout: `Wrote ${written.sizeBytes} bytes to ${absolute}\nUse it outside bb, e.g.: codex exec - < ${absolute}\n`,
+          stdout: `Wrote ${written.sizeBytes} bytes to ${absolute}\nWrote ${archiveParts.length} unabridged event archive part(s) alongside it. Keep those files with the document.\n`,
         };
       }
 
@@ -570,6 +578,7 @@ export default async function plugin(bb: BbPluginApi) {
             `Source: ${captured.title} (${captured.providerId}, ${threadId})`,
             `Turns: ${captured.turns}, transcript entries: ${captured.entries.length}, events: ${captured.eventCount}`,
             `Handoff document: ${new TextEncoder().encode(doc).byteLength} bytes`,
+            fidelitySummary(captured),
             `Scope: ${captured.untilSeq != null ? `partial — events up to seq ${captured.untilSeq}` : "full thread"}`,
             `Native session file: ${captured.nativeSessionPath ?? "(not found)"}`,
             `Workspace: ${captured.workspacePath ?? "(none)"}`,

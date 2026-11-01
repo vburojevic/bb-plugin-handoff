@@ -2,6 +2,7 @@
 // provider-independent transcript, plus locate the provider's native session
 // file (Claude Code / Codex) for raw-fidelity reference.
 import type { BbPluginApi } from "@bb/plugin-sdk";
+import { projectInputs, renderInput } from "./capture-inputs";
 
 export const CAPS = {
   reasoning: 2_000,
@@ -68,15 +69,7 @@ function renderItem(item: any): TranscriptEntry | null {
   const nested = Boolean(item.parentToolCallId);
   switch (item.type) {
     case "userMessage": {
-      const parts: string[] = [];
-      for (const part of item.content ?? []) {
-        if (part.type === "text") parts.push(part.text);
-        else if (part.type === "image") parts.push(`[attached image: ${part.url}]`);
-        else if (part.type === "localImage" || part.type === "localFile") {
-          parts.push(`[attached file: ${part.path}]`);
-        }
-      }
-      return { seq: 0, kind: "user", body: clip(parts.join("\n\n"), CAPS.userMessage), nested };
+      return { seq: 0, kind: "user", body: renderInput(item.content), nested };
     }
     case "agentMessage":
       return { seq: 0, kind: "assistant", body: clip(item.text ?? "", CAPS.assistantMessage), nested };
@@ -150,7 +143,9 @@ function renderItem(item: any): TranscriptEntry | null {
       };
     }
     default:
-      return null;
+      // Keep unfamiliar records visible; the unabridged archive preserves all fields.
+      return { seq: 0, kind: "note", title: String(item.type),
+        body: `[${String(item.type)}]\n${stringifyUnknown(item, CAPS.toolResult)}`, nested };
   }
 }
 
@@ -162,6 +157,7 @@ function firstLine(text: string): string {
 /** Project raw thread events into an ordered transcript. Pure. */
 export function projectEvents(rows: EventRowLike[]): ProjectedTranscript {
   const sorted = [...rows].sort((a, b) => a.seq - b.seq);
+  const inputs = projectInputs(sorted);
   const itemOrder: string[] = [];
   // deno-lint-ignore no-explicit-any
   const items = new Map<string, { seq: number; item: any }>();
@@ -180,11 +176,13 @@ export function projectEvents(rows: EventRowLike[]): ProjectedTranscript {
         if (!data.parentToolCallId) turns += 1;
         break;
       case "item/started":
-      case "item/completed": {
+      case "item/completed":
+      case "item/backgroundTask/completed":
+      case "item/delegation/completed": {
         const item = data.item;
         if (!item?.id) break;
         const existing = items.get(item.id);
-        if (existing) existing.item = item;
+        if (existing) existing.item = { ...existing.item, ...item };
         else {
           items.set(item.id, { seq: row.seq, item });
           itemOrder.push(item.id);
@@ -213,9 +211,11 @@ export function projectEvents(rows: EventRowLike[]): ProjectedTranscript {
     const record = items.get(id);
     if (!record) continue;
     const entry = renderItem(record.item);
-    if (entry) entries.push({ ...entry, seq: record.seq });
+    if (entry && !(entry.kind === "user" && !entry.nested && inputs.isEcho(record.seq, entry.body))) {
+      entries.push({ ...entry, seq: record.seq });
+    }
   }
-  entries.push(...notes);
+  entries.push(...notes, ...inputs.entries);
   entries.sort((a, b) => a.seq - b.seq);
   return { entries, providerThreadId, turns };
 }
@@ -285,6 +285,8 @@ function pickJsonl(listing: unknown, sessionId: string): string | null {
 // --- Full capture ------------------------------------------------------------
 
 export interface CapturedSession {
+  /** Full available BB events within the capture boundary, never rendered or clipped. */
+  rawEvents?: EventRowLike[];
   threadId: string;
   title: string;
   providerId: string;
@@ -311,7 +313,8 @@ export interface CaptureOptions {
   untilSeq?: number;
 }
 
-const EVENT_PAGE_SIZE = 1000;
+// BB rejects event pages larger than 100; page through the complete history.
+const EVENT_PAGE_SIZE = 100;
 
 export async function captureThread(
   bb: BbPluginApi,
@@ -349,26 +352,21 @@ export async function captureThread(
     if (page.length < EVENT_PAGE_SIZE) break;
     // A page that reached past the cutoff means nothing relevant comes after.
     if (untilSeq != null && scoped.length < page.length) break;
-    afterSeq = String(page[page.length - 1]!.seq);
+    const nextSeq = page[page.length - 1]!.seq;
+    if (!Number.isSafeInteger(nextSeq) || nextSeq <= Number(afterSeq ?? 0)) {
+      throw new Error("Thread event pagination did not advance; refusing an incomplete capture.");
+    }
+    afterSeq = String(nextSeq);
   }
 
   const { entries, providerThreadId, turns } = projectEvents(rows);
 
-  let latestOutput: string | null = null;
-  if (untilSeq != null) {
-    // The thread-level output belongs to the full session; for a partial
-    // capture the latest in-scope assistant message is the honest "latest".
-    latestOutput = [...entries].reverse().find((entry) => entry.kind === "assistant")?.body ?? null;
-  } else {
-    try {
-      latestOutput = (await bb.sdk.threads.output({ threadId })).output;
-    } catch {
-      // No output yet — fine.
-    }
-  }
+  // Never mix a newer thread-level output into an earlier event snapshot.
+  const latestOutput = [...entries].reverse()
+    .find((entry) => entry.kind === "assistant" && !entry.nested)?.body ?? null;
 
   const providerId: string = thread.providerId ?? "unknown";
-  const nativeSessionPath = await findNativeSessionPath(bb, {
+  const nativeSessionPath = untilSeq != null ? null : await findNativeSessionPath(bb, {
     providerId,
     providerThreadId,
     hostId,
@@ -376,6 +374,7 @@ export async function captureThread(
   });
 
   return {
+    rawEvents: rows,
     threadId,
     title: thread.title ?? thread.titleFallback ?? threadId,
     providerId,

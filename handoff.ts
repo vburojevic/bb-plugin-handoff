@@ -3,6 +3,7 @@
 // thread seeded with it.
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { CAPS, captureThread, type CapturedSession, type TranscriptEntry } from "./capture";
+import { archiveManifest, buildEventArchive, fidelitySummary, type ArchivePart } from "./archive";
 import {
   captureWorkingState,
   deliverPatch,
@@ -61,7 +62,8 @@ export interface HandoffRequest {
 }
 
 /**
- * Whether the receiving thread's first turn confirmed the pickup.
+ * Whether the receiving thread produced a successful first reply (delivery only,
+ * never a claim about context comprehension). "confirmed" is retained for storage compatibility.
  * "pending" until its first idle/failed event (best-effort: pending
  * verifications don't survive a plugin reload and expire after 15 minutes).
  */
@@ -290,6 +292,7 @@ function renderEntry(entry: TranscriptEntry, sourceProvider: string): string {
 }
 
 export interface RenderOptions {
+  archiveParts?: ArchivePart[];
   sameFamily?: boolean;
   /** Where the new thread runs; drives the cross-machine wording. */
   transfer?: TransferPlan | null;
@@ -372,8 +375,8 @@ export function renderHandoff(
 
   const steps = [
     briefing?.trim()
-      ? "Read the outgoing agent's briefing and the full transcript below before doing anything else."
-      : "Read the full transcript below before doing anything else.",
+      ? "Read the outgoing agent's briefing, the user messages, and the Context fidelity section before acting. Read the transcript in bounded chunks."
+      : "Read the user messages and the Context fidelity section before acting. Read the transcript in bounded chunks.",
     ...(sameFamily
       ? [
           "The transcript is YOUR OWN conversation history with this user, continued on a new bb thread. Continue seamlessly: do not re-introduce yourself and do not summarize back what you already know.",
@@ -394,7 +397,7 @@ export function renderHandoff(
               : "If you need raw detail the transcript truncated, the native session file above contains the source provider's full session (JSONL).",
           ]
       : []),
-    `The previous agent is still reachable in bb thread \`${captured.threadId}\`. If something essential is unclear, ask it directly: \`bb thread tell ${captured.threadId} "<your question>" --mode queue\`, then \`bb thread wait ${captured.threadId}\` and \`bb thread output ${captured.threadId}\` to read the answer. Ask at most once or twice, then continue on your own — that agent no longer owns this task.`,
+    `The source thread is \`${captured.threadId}\`. Read its recorded history for missing detail. Do not wake or message the source agent unless the user explicitly requests it.`,
   ];
 
   const header = [
@@ -449,38 +452,37 @@ export function renderHandoff(
       ? renderWorkingState(options.working, transfer, options.patchPath ?? null)
       : "";
 
+  const fidelity = `\n${fidelitySummary(captured)}\n\n${options?.archiveParts ? archiveManifest(options.archiveParts) : "Raw archive is not attached to this preview; use handoff export --out or start a handoff to receive it."}\n`;
+
   const rendered = captured.entries.map((entry) => renderEntry(entry, captured.providerId));
   const transcript = fitTranscript(
     rendered,
-    CAPS.totalDocBytes - header.length - latest.length - briefingSection.length - workingSection.length,
+    CAPS.totalDocBytes - Buffer.byteLength(header + latest + briefingSection + workingSection + fidelity + "\n## Transcript\n\n\n"),
+    captured.entries.flatMap((entry, index) => entry.kind === "user" ? [index] : []),
   );
 
-  return `${header}${workingSection}${latest}${briefingSection}\n## Transcript\n\n${transcript}\n`;
+  const doc = `${header}${workingSection}${latest}${briefingSection}${fidelity}\n## Transcript\n\n${transcript}\n`;
+  if (Buffer.byteLength(doc) > CAPS.totalDocBytes) throw new Error("Handoff metadata exceeds the document byte budget; export a smaller scope.");
+  return doc;
 }
 
 /** Keep the head and tail of the transcript when the whole thing won't fit. */
-export function fitTranscript(blocks: string[], budget: number): string {
+export function fitTranscript(blocks: string[], budget: number, priority: number[] = []): string {
   const joined = blocks.join("\n\n---\n\n");
-  if (joined.length <= budget) return joined;
-
-  const head: string[] = [];
-  const tail: string[] = [];
-  let used = 0;
-  const headCount = Math.min(2, blocks.length);
-  for (let i = 0; i < headCount; i++) {
-    head.push(blocks[i]!);
-    used += blocks[i]!.length + 10;
+  if (Buffer.byteLength(joined) <= budget) return joined;
+  const separator = "\n\n---\n\n";
+  const notice = (count: number) => `> [${count} earlier entries omitted to fit the handoff size budget; read the unabridged event archive]`;
+  let used = Buffer.byteLength(notice(blocks.length));
+  if (used > budget) throw new Error("Handoff transcript budget is too small even for its omission notice.");
+  const chosen = new Set<number>();
+  // Preserve user requirements first, then opening context and the recent tail.
+  const candidates = [...priority, 0, 1, ...blocks.map((_, i) => blocks.length - i - 1)];
+  for (const index of candidates) {
+    if (chosen.has(index) || blocks[index] === undefined) continue;
+    const size = Buffer.byteLength(blocks[index]! + separator);
+    if (used + size <= budget) { chosen.add(index); used += size; }
   }
-  for (let i = blocks.length - 1; i >= headCount; i--) {
-    const block = blocks[i]!;
-    if (used + block.length + 10 > budget) break;
-    tail.unshift(block);
-    used += block.length + 10;
-  }
-  const dropped = blocks.length - head.length - tail.length;
-  return [...head, `> [${dropped} earlier entries omitted to fit the handoff size budget]`, ...tail].join(
-    "\n\n---\n\n",
-  );
+  return [notice(blocks.length - chosen.size), ...[...chosen].sort((a, b) => a - b).map(i => blocks[i]!)].join(separator);
 }
 
 export function buildIntroPrompt(
@@ -500,7 +502,9 @@ export function buildIntroPrompt(
           `This thread runs on a different machine (${transfer.hostName ?? "this machine"}) than the session it continues (${transfer.sourceHostName ?? "the source machine"}), so the previous agent's files are not simply here — the handoff document explains what your workspace contains.`,
         ]
       : []),
-    "Read the attached handoff document in full — it contains the complete conversation transcript and the current state of the work.",
+    "Read the attached handoff document and its Context fidelity section. The readable transcript can be abbreviated; the attached JSONL event archive preserves the available captured BB events.",
+    "Read files in bounded chunks (for example, 100 lines or 8,000 characters per tool result), never one giant cat. Read all User sections and the latest result/briefing, then recover relevant omitted details from the archive. Tool output truncation is not successful reading.",
+    "Before continuing, identify the current goal, constraints, completed work and next step. Verify requirements from the beginning, middle and end; state any missing attachments or unread portions rather than claiming complete context.",
     ...(hasBriefing
       ? [
           "It also contains a briefing the outgoing agent wrote moments before this handoff — treat it as the freshest statement of state and intent.",
@@ -618,7 +622,7 @@ async function runHandoff(
   // appears in the transcript — it travels only as its own document section.
   let briefing: string | null = null;
   let briefingOutcome: BriefingOutcome = "off";
-  if (request.briefing) {
+  if (request.briefing && request.untilSeq == null) {
     publish("briefing");
     const result = await requestBriefing(bb, request.sourceThreadId);
     briefing = result.text;
@@ -648,7 +652,9 @@ async function runHandoff(
 
   publish("rendering");
   const sameFamily = request.providerId === captured.providerId;
+  const archiveParts = buildEventArchive(captured);
   const doc = renderHandoff(captured, new Date(), briefing, {
+    archiveParts,
     sameFamily,
     transfer,
     working,
@@ -664,10 +670,23 @@ async function runHandoff(
     mimeType: "text/markdown",
   });
 
+  const archiveUploads = [];
+  for (const part of archiveParts) {
+    archiveUploads.push(await bb.sdk.projects.attachments.upload({
+      projectId: captured.projectId, clientFile: part.bytes,
+      filename: part.name, mimeType: "application/x-ndjson",
+    }));
+  }
+
   publish("spawning");
   const thread = await bb.sdk.threads.spawn({
     projectId: captured.projectId,
     providerId: request.providerId,
+    executionInputSources: {
+      providerId: "explicit",
+      ...(request.model ? { model: "explicit" as const } : {}),
+      ...(request.reasoningLevel ? { reasoningLevel: "explicit" as const } : {}),
+    },
     ...(request.model ? { model: request.model } : {}),
     ...(request.reasoningLevel ? { reasoningLevel: request.reasoningLevel } : {}),
     environment,
@@ -685,6 +704,8 @@ async function runHandoff(
         sizeBytes: uploaded.sizeBytes,
         ...(uploaded.mimeType ? { mimeType: uploaded.mimeType } : {}),
       },
+      ...archiveUploads.map(file => ({ type: "localFile" as const, path: file.path,
+        name: file.name, sizeBytes: file.sizeBytes, ...(file.mimeType ? { mimeType: file.mimeType } : {}) })),
     ],
   });
 
