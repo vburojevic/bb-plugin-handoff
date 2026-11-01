@@ -1,9 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { BbPluginApi } from "@bb/plugin-sdk";
 import {
   CAPS,
+  captureThread,
   claudeProjectSlug,
   clip,
   deriveHomeDir,
+  findNativeSessionPath,
   projectEvents,
   type EventRowLike,
 } from "./capture";
@@ -81,6 +84,80 @@ function claudeStyleEvents(): EventRowLike[] {
   ];
 }
 
+describe("captureThread pagination", () => {
+  it.each([
+    { count: 0, serverCap: 100 },
+    { count: 1, serverCap: 100 },
+    { count: 100, serverCap: 100 },
+    { count: 205, serverCap: 100 },
+    { count: 205, serverCap: 50 },
+  ])("captures all $count events when the server caps pages at $serverCap", async ({ count, serverCap }) => {
+    type ListEvents = BbPluginApi["sdk"]["threads"]["events"]["list"];
+    const events = Array.from({ length: count }, (_, index) => ({
+      id: `evt_${index}`,
+      threadId: "thr_1",
+      scope: { kind: "thread" },
+      seq: index * 2 + 1,
+      createdAt: index,
+      type: "item/completed",
+      data: {
+        providerThreadId: "session_1",
+        item: { id: `msg_${index}`, type: "agentMessage", text: `Message ${index}` },
+      },
+    } satisfies Awaited<ReturnType<ListEvents>>[number]));
+    const list = vi.fn<ListEvents>(async ({ afterSeq, limit }) => {
+      const pageSize = Number(limit);
+      if (pageSize > 100) throw new Error("Thread event limit cannot exceed 100");
+      return events.filter((event) => event.seq > Number(afterSeq ?? 0)).slice(0, Math.min(pageSize, serverCap));
+    });
+    const bb = {
+      sdk: {
+        threads: {
+          get: async () => ({ id: "thr_1", providerId: "codex", environmentId: null }),
+          events: { list },
+          output: async () => ({ output: "Done." }),
+        },
+      },
+    } as unknown as BbPluginApi;
+
+    const captured = await captureThread(bb, "thr_1");
+
+    expect(captured.eventCount).toBe(count);
+    expect(captured.entries.map((entry) => entry.body)).toEqual(events.map((event) => event.data.item.text));
+    expect(list).toHaveBeenCalledTimes(Math.ceil(count / serverCap) + 1);
+  });
+});
+
+describe("captureThread paging guards", () => {
+  type ListEvents = BbPluginApi["sdk"]["threads"]["events"]["list"];
+  const event = (seq: number) => ({
+    id: `evt_${seq}`, threadId: "thr_1", scope: { kind: "thread" }, seq, createdAt: seq, type: "item/completed",
+    data: { providerThreadId: "session_1", item: { id: `msg_${seq}`, type: "agentMessage", text: `Message ${seq}` } },
+  } satisfies Awaited<ReturnType<ListEvents>>[number]);
+  const api = (list: ListEvents) => ({
+    sdk: { threads: {
+      get: async () => ({ id: "thr_1", providerId: "codex", environmentId: null }),
+      events: { list },
+      output: async () => ({ output: "Done." }),
+    } },
+  } as unknown as BbPluginApi);
+
+  it("stops at untilSeq inside a later capped page", async () => {
+    const events = Array.from({ length: 120 }, (_, index) => event(index + 1));
+    const list = vi.fn<ListEvents>(async ({ afterSeq }) =>
+      events.filter((row) => row.seq > Number(afterSeq ?? 0)).slice(0, 50));
+    const captured = await captureThread(api(list), "thr_1", { untilSeq: 75 });
+    expect(captured.eventCount).toBe(75);
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails instead of looping when the server ignores the cursor", async () => {
+    const list = vi.fn<ListEvents>(async () => [event(1), event(2)]);
+    await expect(captureThread(api(list), "thr_1")).rejects.toThrow("did not advance");
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("projectEvents", () => {
   it("projects a full session into ordered transcript entries", () => {
     const { entries, providerThreadId, turns } = projectEvents(claudeStyleEvents());
@@ -149,6 +226,68 @@ describe("native session discovery helpers", () => {
     expect(claudeProjectSlug("/Users/dev/.bb/personal-workspaces/env_d699ce8g2z")).toBe(
       "-Users-dev--bb-personal-workspaces-env-d699ce8g2z",
     );
+  });
+});
+
+describe("findNativeSessionPath", () => {
+  type ListFiles = BbPluginApi["sdk"]["files"]["list"];
+  const api = (paths: string[]) => {
+    const list = vi.fn<ListFiles>(async () => ({
+      files: paths.map((path) => ({ name: path.slice(path.lastIndexOf("/") + 1), path })),
+      truncated: false,
+    }));
+    return { list, bb: { sdk: { files: { list } } } as unknown as BbPluginApi };
+  };
+  const query = (providerId: string) => ({
+    providerId, providerThreadId: "abc-123", hostId: "host_1", workspacePath: "/Users/dev/work",
+  });
+
+  it("picks the Claude Code main transcript over subagent transcripts listed first", async () => {
+    const { bb } = api(["abc-123/subagents/agent-a1.jsonl", "abc-123/subagents/agent-a2.jsonl", "abc-123.jsonl"]);
+    expect(await findNativeSessionPath(bb, query("claude-code"))).toBe(
+      "/Users/dev/.claude/projects/-Users-dev-work/abc-123.jsonl",
+    );
+  });
+
+  it("finds the Claude Code main transcript past 100 subagent transcripts", async () => {
+    type ListFiles = BbPluginApi["sdk"]["files"]["list"];
+    const paths = [
+      ...Array.from({ length: 100 }, (_, index) => `abc-123/subagents/agent-a${index}.jsonl`),
+      "abc-123.jsonl",
+    ];
+    // Like bb's listing: paths containing the query, subagents ranked first, capped at the limit.
+    const list = vi.fn<ListFiles>(async ({ query, limit }) => ({
+      files: paths
+        .filter((path) => path.includes(query ?? ""))
+        .slice(0, limit)
+        .map((path) => ({ name: path.slice(path.lastIndexOf("/") + 1), path })),
+      truncated: false,
+    }));
+    const bb = { sdk: { files: { list } } } as unknown as BbPluginApi;
+    expect(await findNativeSessionPath(bb, query("claude-code"))).toBe(
+      "/Users/dev/.claude/projects/-Users-dev-work/abc-123.jsonl",
+    );
+  });
+
+  it("returns null when only subagent transcripts match", async () => {
+    const { bb } = api(["abc-123/subagents/agent-a1.jsonl"]);
+    expect(await findNativeSessionPath(bb, query("claude-code"))).toBeNull();
+  });
+
+  it("matches the Codex rollout whose id suffix is exact", async () => {
+    const { bb } = api([
+      "2026/10/09/rollout-2026-10-09T01-00-00-xabc-123.jsonl",
+      "2026/10/09/rollout-2026-10-09T02-00-00-abc-123.jsonl",
+    ]);
+    expect(await findNativeSessionPath(bb, query("codex"))).toBe(
+      "/Users/dev/.codex/sessions/2026/10/09/rollout-2026-10-09T02-00-00-abc-123.jsonl",
+    );
+  });
+
+  it("skips the listing for providers without a known session layout", async () => {
+    const { bb, list } = api(["abc-123.jsonl"]);
+    expect(await findNativeSessionPath(bb, query("gemini"))).toBeNull();
+    expect(list).not.toHaveBeenCalled();
   });
 });
 

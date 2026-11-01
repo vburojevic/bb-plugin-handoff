@@ -253,31 +253,46 @@ export async function findNativeSessionPath(
   if (!providerThreadId || !workspacePath) return null;
   const home = deriveHomeDir(workspacePath);
   if (!home) return null;
+  // The listing is a recursive fuzzy search, so it also returns files that
+  // merely sit under a directory named for the session (Claude Code keeps
+  // subagent transcripts in <session-id>/subagents/). Match the exact name.
+  const target = nativeSessionTarget(providerId, home, workspacePath, providerThreadId);
+  if (!target) return null;
   try {
-    if (providerId === "claude-code") {
-      const dir = `${home}/.claude/projects/${claudeProjectSlug(workspacePath)}`;
-      const listing = await bb.sdk.files.list({ hostId, path: dir, query: providerThreadId, limit: 5 });
-      const hit = pickJsonl(listing, providerThreadId);
-      return hit ? `${dir}/${hit}` : null;
-    }
-    if (providerId === "codex") {
-      const dir = `${home}/.codex/sessions`;
-      const listing = await bb.sdk.files.list({ hostId, path: dir, query: providerThreadId, limit: 5 });
-      const hit = pickJsonl(listing, providerThreadId);
-      return hit ? `${dir}/${hit}` : null;
-    }
+    const listing = await bb.sdk.files.list({ hostId, path: target.dir, query: target.query, limit: 100 });
+    const hit = listing.files.find((file) => target.matches(file.path));
+    return hit ? `${target.dir}/${hit.path}` : null;
   } catch {
     return null;
   }
-  return null;
 }
 
-function pickJsonl(listing: unknown, sessionId: string): string | null {
-  // deno-lint-ignore no-explicit-any
-  const files: any[] = Array.isArray(listing) ? listing : ((listing as any)?.files ?? (listing as any)?.entries ?? []);
-  for (const file of files) {
-    const path: string | undefined = typeof file === "string" ? file : file?.path ?? file?.relativePath;
-    if (path && path.includes(sessionId) && path.endsWith(".jsonl")) return path;
+function nativeSessionTarget(
+  providerId: string,
+  home: string,
+  workspacePath: string,
+  sessionId: string,
+): { dir: string; query: string; matches: (relativePath: string) => boolean } | null {
+  if (providerId === "claude-code") {
+    // <projects>/<cwd-slug>/<session-id>.jsonl, directly in the project dir.
+    // Query the full file name: with the bare id, a session with 100 or more
+    // subagent transcripts pushes the main file out of the listing.
+    return {
+      dir: `${home}/.claude/projects/${claudeProjectSlug(workspacePath)}`,
+      query: `${sessionId}.jsonl`,
+      matches: (relativePath) => relativePath === `${sessionId}.jsonl`,
+    };
+  }
+  if (providerId === "codex") {
+    // <sessions>/YYYY/MM/DD/rollout-<timestamp>-<session-id>.jsonl
+    return {
+      dir: `${home}/.codex/sessions`,
+      query: sessionId,
+      matches: (relativePath) => {
+        const base = relativePath.slice(relativePath.lastIndexOf("/") + 1);
+        return base.startsWith("rollout-") && base.endsWith(`-${sessionId}.jsonl`);
+      },
+    };
   }
   return null;
 }
@@ -311,7 +326,7 @@ export interface CaptureOptions {
   untilSeq?: number;
 }
 
-const EVENT_PAGE_SIZE = 1000;
+const EVENT_PAGE_SIZE = 100;
 
 export async function captureThread(
   bb: BbPluginApi,
@@ -346,10 +361,17 @@ export async function captureThread(
     })) as unknown as EventRowLike[];
     const scoped = untilSeq != null ? page.filter((row) => row.seq <= untilSeq) : page;
     rows.push(...scoped);
-    if (page.length < EVENT_PAGE_SIZE) break;
+    // Stop only on an empty page: the server may cap pages below the requested
+    // limit, so a short page does not prove the stream is exhausted.
+    if (page.length === 0) break;
     // A page that reached past the cutoff means nothing relevant comes after.
     if (untilSeq != null && scoped.length < page.length) break;
-    afterSeq = String(page[page.length - 1]!.seq);
+    const lastSeq = page[page.length - 1]!.seq;
+    // A cursor that does not advance would page forever.
+    if (afterSeq !== undefined && lastSeq <= Number(afterSeq)) {
+      throw new Error("Thread event paging did not advance.");
+    }
+    afterSeq = String(lastSeq);
   }
 
   const { entries, providerThreadId, turns } = projectEvents(rows);

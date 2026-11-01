@@ -103,9 +103,9 @@ function makeFakeBb(
           },
         },
         events: {
-          list: async (args: unknown) => {
+          list: async (args: { afterSeq?: string }) => {
             record("threads.events.list", args);
-            return events;
+            return events.filter((event) => event.seq > Number(args.afterSeq ?? 0));
           },
         },
         output: async (args: unknown) => {

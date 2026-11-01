@@ -116,13 +116,14 @@ function makeFakeBb(options: { dirty?: boolean; patchWritable?: boolean } = {}) 
   // The event pager expects threads.events.list; keep it separate for clarity.
   // deno-lint-ignore no-explicit-any
   (bb.sdk.threads as any).events = {
-    list: async () => [
-      {
-        seq: 1,
-        type: "item/completed",
-        data: { item: { type: "userMessage", id: "u1", content: [{ type: "text", text: "Stream it" }] } },
-      },
-    ],
+    list: async ({ afterSeq }: { afterSeq?: string }) =>
+      [
+        {
+          seq: 1,
+          type: "item/completed",
+          data: { item: { type: "userMessage", id: "u1", content: [{ type: "text", text: "Stream it" }] } },
+        },
+      ].filter((event) => event.seq > Number(afterSeq ?? 0)),
   };
   return { bb: bb as unknown as BbPluginApi, calls, kv };
 }
