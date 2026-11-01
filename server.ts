@@ -10,6 +10,7 @@ import { z } from "zod";
 import { adoptCommandSpecs, runAdoptCli } from "./adopt/cli";
 import { adoptRpcShape, createAdoptRpcHandlers } from "./adopt/rpc";
 import { captureThread } from "./capture";
+import { providerIconTint } from "./lib/provider-icon";
 import {
   listHandoffs,
   REASONING_LEVELS,
@@ -87,6 +88,8 @@ export const rpcContract = defineRpcContract({
           displayName: z.string(),
           available: z.boolean(),
           logoUrl: z.string().nullable(),
+          /** bb's brand color for the mark, per color scheme; null draws it in the text color. */
+          iconTint: z.object({ light: z.string(), dark: z.string() }).nullable(),
         }),
       ),
       machines: z.array(
@@ -277,6 +280,7 @@ export default async function plugin(bb: BbPluginApi) {
           displayName: provider.displayName,
           available: provider.available,
           logoUrl: provider.logoUrl ?? null,
+          iconTint: providerIconTint(provider),
         })),
         machines: machines.map((machine, index) => ({
           id: machine.id,
