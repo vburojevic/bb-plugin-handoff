@@ -36,6 +36,7 @@ const AGENT_LABELS: Record<string, string> = {
   codex: "Codex",
   gemini: "Gemini",
   opencode: "OpenCode",
+  pi: "Pi",
 };
 
 const VISIBLE_SESSIONS = 5;
@@ -306,7 +307,7 @@ export function AdoptSection({ projectId: projectIdProp }: { projectId: string |
         >
           <Icon name="Download" aria-hidden />
           <span className="min-w-0 flex-1 truncate text-left">
-            Continue a session from another agent — Claude Code, Codex, Gemini CLI, OpenCode…
+            Continue a session from another agent — Claude Code, Codex, Gemini CLI, OpenCode, Pi…
           </span>
           <Icon name={open ? "ChevronUp" : "ChevronDown"} aria-hidden />
         </Button>

@@ -3,12 +3,14 @@ import { claudeAdapter } from "./claude";
 import { codexAdapter } from "./codex";
 import { geminiAdapter } from "./gemini";
 import { opencodeAdapter } from "./opencode";
+import { piAdapter } from "./pi";
 
 export const ADAPTERS: readonly AgentAdapter[] = [
   claudeAdapter,
   codexAdapter,
   geminiAdapter,
   opencodeAdapter,
+  piAdapter,
 ];
 
 const ALIASES: Record<string, AgentId> = {
@@ -19,6 +21,7 @@ const ALIASES: Record<string, AgentId> = {
   "gemini-cli": "gemini",
   opencode: "opencode",
   "acp-opencode": "opencode",
+  pi: "pi",
 };
 
 export function resolveAgentId(value: string): AgentId | null {

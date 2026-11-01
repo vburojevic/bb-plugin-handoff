@@ -12,6 +12,7 @@ import { claudeProjectSlug } from "../capture";
 import { parseClaudeContent } from "./agents/claude";
 import { parseCodexContent } from "./agents/codex";
 import { geminiChatsDir, parseGeminiContent } from "./agents/gemini";
+import { parsePiContent, piSessionSlug } from "./agents/pi";
 import {
   opencodeDbPath,
   opencodeFindSql,
@@ -30,7 +31,7 @@ export interface RemoteContext {
 }
 
 /** Stores that a remote adopt can read at all, and how it reads them. */
-export const REMOTE_AGENTS: readonly AgentId[] = ["claude", "codex", "gemini", "opencode"];
+export const REMOTE_AGENTS: readonly AgentId[] = ["claude", "codex", "gemini", "opencode", "pi"];
 
 // --- Remote execution -------------------------------------------------------
 
@@ -120,11 +121,13 @@ export function buildListScript(home: string, cwd: string, codexScanLimit = 400)
   const claudeDir = `${home}/.claude/projects/${claudeProjectSlug(cwd)}`;
   const geminiDir = geminiChatsDir(cwd, home);
   const codexDir = `${home}/.codex/sessions`;
+  const piDir = `${home}/.pi/agent/sessions/${piSessionSlug(cwd)}`;
   const db = opencodeDbPath(home);
   // Every line is `agent \t sessionId \t <stat or payload>`; an empty id means
   // "derive it from the path", which only Gemini cannot do.
   return [
     STAT_PRELUDE,
+    `d=${shellQuote(piDir)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'pi\\t\\t'; emit "$f"; }; done; fi`,
     `d=${shellQuote(claudeDir)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'claude\\t\\t'; emit "$f"; }; done; fi`,
     `d=${shellQuote(geminiDir)}; if [ -d "$d" ]; then for f in "$d"/session-*.json; do [ -f "$f" ] || continue; i=$(head -c 400 "$f" | tr -d '\\n' | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1); printf 'gemini\\t%s\\t' "$i"; emit "$f"; done; fi`,
     `d=${shellQuote(codexDir)}; if [ -d "$d" ]; then find "$d" -type f -name 'rollout-*.jsonl' | sort -r | head -n ${codexScanLimit} | while read -r f; do head -c 65536 "$f" | grep -qF ${shellQuote(`"cwd":"${cwd}"`)} && { printf 'codex\\t\\t'; emit "$f"; }; done; fi`,
@@ -136,6 +139,7 @@ export function buildListScript(home: string, cwd: string, codexScanLimit = 400)
 function idFromPath(agent: AgentId, filePath: string): string {
   const base = filePath.slice(filePath.lastIndexOf("/") + 1);
   if (agent === "claude") return base.replace(/\.jsonl$/, "");
+  if (agent === "pi") return base.replace(/^\d{4}-\d{2}-\d{2}T[^_]+_/, "").replace(/\.jsonl$/, "");
   if (agent === "codex") {
     const match = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
     return match ? match[1]!.toLowerCase() : base.replace(/\.jsonl$/, "");
@@ -309,6 +313,24 @@ export async function findRemoteSession(
       });
     }
   }
+  if (wanted("pi")) {
+    // The file API's query is fuzzy. Check the id suffix, not the timestamp or
+    // cwd directory, and retain every match so prefixes can be disambiguated.
+    const root = `${ctx.home}/.pi/agent/sessions`;
+    try {
+      const listing = await ctx.bb.sdk.files.list({
+        hostId: ctx.hostId, path: root, query: sessionId, limit: 50,
+      });
+      for (const file of pathsOfListing(listing)) {
+        const id = idFromPath("pi", file);
+        if (!file.endsWith(".jsonl") || !id.toLowerCase().startsWith(sessionId.toLowerCase())) continue;
+        found.push({
+          agent: "pi", sessionId: id, filePath: `${root}/${file}`,
+          modifiedAtMs: 0, sizeBytes: 0, title: null, cwd: null,
+        });
+      }
+    } catch { /* Pi may not have a session store on this machine. */ }
+  }
   if (found.length === 0 && wanted("gemini")) {
     const path = await findGeminiByExec(ctx, sessionId);
     if (path) {
@@ -393,5 +415,6 @@ export async function readRemoteSession(
   const content = await readRemoteFile(ctx, session.filePath);
   if (session.agent === "claude") return parseClaudeContent(content, session.filePath, { maxChars });
   if (session.agent === "codex") return parseCodexContent(content, session.filePath, { maxChars });
+  if (session.agent === "pi") return parsePiContent(content, session.filePath, { maxChars });
   return parseGeminiContent(content, session.filePath, { maxChars });
 }

@@ -1,6 +1,6 @@
 ---
 name: handoff
-description: Move a session between agents and between machines, in either direction — hand the current bb thread off to another agent/provider (e.g. continue a Claude Code session in Codex) and optionally onto another enrolled machine, or adopt a session that ran outside bb (Claude Code, Codex, Gemini CLI, OpenCode) on this or another machine as a bb thread. Use when the user asks to hand off, switch providers, continue with another agent/model, move or resume work on another machine, export the session for use outside bb, or continue/adopt/import an external terminal session into bb.
+description: Move a session between agents and between machines, in either direction — hand the current bb thread off to another agent/provider (e.g. continue a Claude Code session in Codex) and optionally onto another enrolled machine, or adopt a session that ran outside bb (Claude Code, Codex, Gemini CLI, OpenCode, Pi) on this or another machine as a bb thread. Use when the user asks to hand off, switch providers, continue with another agent/model, move or resume work on another machine, export the session for use outside bb, or continue/adopt/import an external terminal session into bb.
 ---
 
 # Session handoff
@@ -11,7 +11,7 @@ Move a whole session between agents, in both directions.
   bb's event log (works for every provider), render a handoff document, and
   spawn a new thread on the target provider seeded with it.
 - **In (adopt)** — take a session that ran *outside* bb in a terminal (Claude
-  Code, Codex, Gemini CLI, or OpenCode), and continue it as a bb thread in the
+  Code, Codex, Gemini CLI, OpenCode, or Pi), and continue it as a bb thread in the
   same directory with its full history.
 
 Both directions cross machines with `--machine <host>`: hand a thread off to
@@ -62,18 +62,25 @@ another enrolled machine, or adopt a session that lives on one.
   read *that* machine's session stores; a pasted session id is still looked up
   on the bb server machine unless you add `--machine`.
 - `bb handoff adopt <id | resume command>` — paste a session id, an id prefix,
-  or a whole resume command (`claude --resume <id>`, `codex resume <id>`); the
+  or a whole resume command (`claude --resume <id>`, `codex resume <id>`, `pi --session <id>`); the
   id is located across every agent's session store, in any directory.
-- `bb handoff adopt list [--cwd <path>] [--agent claude|codex|gemini|opencode]`
+- `bb handoff adopt list [--cwd <path>] [--agent claude|codex|gemini|opencode|pi]`
   — show adoptable sessions for a directory, newest first.
 - `bb handoff adopt <id> --machine <host name|id> [--home <path>] [--cwd <path>]`
   — adopt a session living on another enrolled machine; the thread runs there,
-  in the session's own directory. Claude Code and Codex are found by id alone;
+  in the session's own directory. Claude Code, Codex and Pi are found by id alone;
   Gemini and OpenCode need `--cwd` (or an exact id). With `--cwd` and no id,
   the newest session for that directory over there is adopted.
 - `bb handoff adopt list --machine <host> --cwd <path>` — what is adoptable in
   a directory on another machine. `--cwd` is required there: the invoking
   directory is a path on *this* machine.
+- Pi adoption follows the last persisted branch and preserves conversation
+  text, tool-call summaries, compactions and branch summaries, but omits system
+  prompts, thinking, tool output and image bytes. Source sessions are read-only.
+  Local discovery respects `PI_CODING_AGENT_DIR` and
+  `PI_CODING_AGENT_SESSION_DIR` in the bb server environment; remote discovery
+  uses the default store. Arbitrary `--session-dir` paths and Pi settings-file
+  storage overrides are not discovered.
 - Useful flags: `--dry-run` (plan only), `--force` (re-adopt a session already
   adopted), `--thread-provider <id>` (continue on a different bb provider),
   `--effort <level>` (thinking effort for the new thread), `--json`.

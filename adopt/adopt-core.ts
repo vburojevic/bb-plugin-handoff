@@ -23,7 +23,7 @@ export async function collectSessions(
   if (agentFilter) {
     const id = resolveAgentId(agentFilter);
     if (!id) {
-      return { error: `Unknown agent "${agentFilter}". Supported: claude, codex, gemini, opencode.` };
+      return { error: `Unknown agent "${agentFilter}". Supported: claude, codex, gemini, opencode, pi.` };
     }
     adapters = [getAdapter(id)];
   }
@@ -51,6 +51,7 @@ export function parseAdoptQuery(text: string): ParsedQuery {
   else if (/\bclaude\b/i.test(trimmed)) agentHint = "claude";
   else if (/\bcodex\b/i.test(trimmed)) agentHint = "codex";
   else if (/\bgemini\b/i.test(trimmed)) agentHint = "gemini";
+  else if (/\bpi\b/i.test(trimmed)) agentHint = "pi";
 
   // OpenCode session ids are `ses_<base62>` — not hex, so match them first.
   const sesId = trimmed.match(/\bses_[A-Za-z0-9]{4,}\b/);
@@ -59,7 +60,8 @@ export function parseAdoptQuery(text: string): ParsedQuery {
   const uuid = trimmed.match(UUID_RE);
   if (uuid) return { sessionId: uuid[0].toLowerCase(), agentHint, newest: false };
 
-  const resume = trimmed.match(/(?:--resume(?:=|\s+)|(?:^|\s)-r\s+|\bresume\s+)["'`]?([\w-]+)/i);
+  const resume = trimmed.match(/(?:--resume(?:=|\s+)|(?:^|\s)-r\s+|\bresume\s+)["'`]?([\w-]+)/i)
+    ?? (agentHint === "pi" ? trimmed.match(/--session(?:=|\s+)["'`]?([\w-]+)/i) : null);
   if (resume?.[1] && !resume[1].startsWith("-")) {
     return { sessionId: resume[1], agentHint, newest: false };
   }
@@ -633,7 +635,7 @@ export async function listRemoteSessionsForDirectory(
   if (options.agent) {
     agentFilter = resolveAgentId(options.agent);
     if (!agentFilter) {
-      return { error: `Unknown agent "${options.agent}". Supported: claude, codex, gemini, opencode.` };
+      return { error: `Unknown agent "${options.agent}". Supported: claude, codex, gemini, opencode, pi.` };
     }
   }
   const { sessions, execFailed } = await listRemoteSessions(resolved.ctx, options.cwd, agentFilter);

@@ -31,7 +31,7 @@ That's the whole idea, applied in both directions:
 |                | From                                    | To                                          |
 | -------------- | --------------------------------------- | ------------------------------------------- |
 | **Hand off**   | a bb thread on any provider             | a new thread on any other provider, any enrolled machine |
-| **Adopt**      | a Claude Code / Codex / Gemini / OpenCode session in your terminal | a bb thread in the same directory, with its history |
+| **Adopt**      | a Claude Code / Codex / Gemini / OpenCode / Pi session in your terminal | a bb thread in the same directory, with its history |
 
 ---
 
@@ -119,6 +119,7 @@ Paste a session id — or the whole resume command you'd have typed —
 ```
 claude --resume 9ace2fd5-d8ae-4946-a0a0-9ff58a6795df
 codex resume 019fd95c-907f-7eb1-8dfc-2aad427ffc09
+pi --session 11111111-2222-4333-8444-555555555555
 ```
 
 — or just browse recent sessions per project and tap one.
@@ -129,6 +130,7 @@ codex resume 019fd95c-907f-7eb1-8dfc-2aad427ffc09
 | Codex CLI   | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `codex`                               |
 | Gemini CLI  | `~/.gemini/tmp/<sha256(cwd)>/chats/*.json`     | `claude-code` (no bb Gemini provider) |
 | OpenCode    | `~/.local/share/opencode/opencode.db` (SQLite) | `acp-opencode`                        |
+| Pi          | `~/.pi/agent/sessions/--<cwd>--/*.jsonl`        | `pi`                                  |
 
 - Claude Code's store moves with `CLAUDE_CONFIG_DIR`. Adoption reads the
   configured directory, the default `~/.claude`, and any sibling profile
@@ -136,6 +138,14 @@ codex resume 019fd95c-907f-7eb1-8dfc-2aad427ffc09
   under a non-default profile are adoptable too.
 - The new thread starts **in the session's own directory**, so the files are
   exactly where you left them.
+- Pi imports the last persisted branch, not abandoned alternatives. User and
+  assistant text, tool-call summaries, compactions and branch summaries carry
+  over; system prompts, thinking, tool output, image bytes and extension state
+  do not. Context edits on that branch are honored. Source files stay untouched.
+- Local Pi discovery respects `PI_CODING_AGENT_DIR` and
+  `PI_CODING_AGENT_SESSION_DIR` in the **bb server process**. Remote Pi discovery
+  currently reads the default `~/.pi/agent/sessions` store; per-invocation
+  `--session-dir` paths and Pi settings-file overrides are not discovered.
 - The transcript rides along as agent-only context: your bb timeline stays
   clean, the agent gets the full history.
 - The project is matched from the directory (longest project-source prefix);
@@ -144,7 +154,7 @@ codex resume 019fd95c-907f-7eb1-8dfc-2aad427ffc09
   running" — in the session list and to the new agent, which watches for
   concurrent edits.
 - `--machine <host>` adopts from another enrolled machine and runs the thread
-  over there. Claude and Codex resolve from a session id alone; Gemini and
+  over there. Claude, Codex and Pi resolve from a session id alone; Gemini and
   OpenCode need `--cwd`, since their ids live inside a file and a SQLite row.
   The panel has the same axis: a **From machine** picker appears once a second
   machine is enrolled. And `bb handoff adopt` run from a bb thread that lives
@@ -185,6 +195,8 @@ bb handoff list [--json]                         # past handoffs (last 100)
 bb handoff adopt                                 # newest session for this directory
 bb handoff adopt 9ace2fd5                        # by id or prefix, any directory
 bb handoff adopt "claude --resume 9ace2fd5-…"    # or the whole resume command
+bb handoff adopt "pi --session 11111111-…"       # Pi ids and resume commands too
+bb handoff adopt list --agent pi --cwd <path>    # only Pi sessions
 bb handoff adopt list --cwd <path>               # what's adoptable here
 bb handoff adopt list --machine mini --cwd <path>   # …and over there
 ```
@@ -221,8 +233,8 @@ lookup, `parse(file)` for transcript blocks — and registering it in
   build output, ignored files and anything outside the repo stay behind.
 - **Remote reads need the machine connected.** Discovery there runs one
   short-lived terminal (POSIX `sh`, `stat`, `find`, plus `sqlite3` for
-  OpenCode); without it, adoption by explicit session id still works for Claude
-  and Codex through the file API alone.
+  OpenCode); without it, adoption by explicit session id still works for Claude,
+  Codex and Pi through the file API alone.
 - **Remote listings are directory-scoped** (`--cwd` is required — the invoking
   directory is a path on *this* machine) and show no titles, since reading one
   would cost a round trip per session.
@@ -234,7 +246,7 @@ lookup, `parse(file)` for transcript blocks — and registering it in
 
 ```sh
 npm install
-npm test            # 122 unit tests: capture/render, transfer planning,
+npm test            # capture/render, transfer planning,
                     # adopt engine + adapters, remote store readers, CLI guards
 npm run typecheck
 bb plugin install . # register this checkout with your bb
