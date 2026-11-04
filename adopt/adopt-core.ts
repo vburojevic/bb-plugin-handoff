@@ -8,6 +8,7 @@ import { listMachines, matchMachine } from "../machines";
 import { ADAPTERS, getAdapter, resolveAgentId } from "./agents";
 import {
   findRemoteSession,
+  hostExec,
   listRemoteSessions,
   readRemoteSession,
   type RemoteContext,
@@ -579,9 +580,14 @@ async function resolveRemoteContext(
     };
   }
 
-  // Home directory on that machine: explicit override, else derived from a
-  // project source that lives there.
+  // Ask the target host before guessing from project paths: it may have no
+  // registered sources, or its home may not follow /home or /Users layouts.
   let home = homeOverride?.trim() || null;
+  if (!home) {
+    const output = await hostExec(bb, host.id, 'printf \'%s\' "$HOME"');
+    const candidate = output?.trim();
+    if (candidate?.startsWith("/") && !/[\r\n\0]/.test(candidate)) home = candidate;
+  }
   if (!home) {
     const projects = await bb.sdk.projects.list({ includePersonal: true }).catch(() => []);
     for (const project of projects) {

@@ -234,8 +234,10 @@ function pathsOfListing(listing: unknown): string[] {
 }
 
 /**
- * Claude and Codex put the session id in the filename, so bb's remote fuzzy
- * file listing finds them without running anything on the machine.
+ * Claude transcripts live directly inside each project directory. A fuzzy
+ * search also matches the parent id in subagent paths and may omit the main
+ * transcript from its limited results, so enumerate only that store level.
+ * Codex rollouts retain their recursive, date-sharded lookup.
  */
 async function findByFilename(
   ctx: RemoteContext,
@@ -243,6 +245,19 @@ async function findByFilename(
   sessionId: string,
 ): Promise<string | null> {
   const root = agent === "claude" ? `${ctx.home}/.claude/projects` : `${ctx.home}/.codex/sessions`;
+  if (agent === "claude") {
+    const output = await hostExec(
+      ctx.bb,
+      ctx.hostId,
+      `r=${shellQuote(root)}; for f in "$r"/*/*.jsonl; do [ -f "$f" ] && printf '%s\\n' "$f"; done`,
+    );
+    return (output ?? "").split("\n").find((p) => {
+      const relative = p.slice(root.length + 1).split("/");
+      return p.startsWith(`${root}/`) && relative.length === 2 &&
+        relative[1]!.toLowerCase().startsWith(sessionId.toLowerCase()) &&
+        relative[1]!.endsWith(".jsonl");
+    }) ?? null;
+  }
   try {
     const listing = await ctx.bb.sdk.files.list({
       hostId: ctx.hostId,
