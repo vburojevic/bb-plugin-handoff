@@ -64,6 +64,39 @@ describe("remote Claude lookup", () => {
   });
 });
 
+describe("remote Claude id prefixes", () => {
+  const OTHER = "7862d82b-0000-4000-8000-000000000000";
+  function store(files: string[]) {
+    const home = mkdtempSync(join(tmpdir(), "handoff-prefix-"));
+    roots.push(home);
+    for (const file of files) {
+      mkdirSync(join(home, ".claude/projects", file, ".."), { recursive: true });
+      writeFileSync(join(home, ".claude/projects", file), transcript(false));
+    }
+    return home;
+  }
+
+  it("reports every session that shares a prefix, with its full id", async () => {
+    const home = store([`-work/${ID}.jsonl`, `-other/${OTHER}.jsonl`]);
+    const found = await findRemoteSession(remote(home).ctx, "7862d82b", "claude");
+    expect(found.map((f) => f.sessionId).sort()).toEqual([OTHER, ID].sort());
+    const result = await performAdoptRemote(remote(home).bb, { machine: "remote", sessionId: "7862d82b", agent: "claude", dryRun: true });
+    expect(result).toMatchObject({ ok: false, code: "ambiguous" });
+  });
+
+  it("selects one session by full id when another shares its prefix", async () => {
+    const home = store([`-work/${ID}.jsonl`, `-other/${OTHER}.jsonl`]);
+    const found = await findRemoteSession(remote(home).ctx, ID, "claude");
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ sessionId: ID, filePath: join(home, ".claude/projects", `-work/${ID}.jsonl`) });
+  });
+
+  it("treats one id in two project directories as one session", async () => {
+    const home = store([`-a/${ID}.jsonl`, `-b/${ID}.jsonl`]);
+    expect(await findRemoteSession(remote(home).ctx, ID.slice(0, 8), "claude")).toHaveLength(1);
+  });
+});
+
 describe("remote home discovery", () => {
   it("lists sessions without a project source or explicit home", async () => {
     const home = mkdtempSync(join(tmpdir(), "handoff-home-"));

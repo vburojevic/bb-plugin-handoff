@@ -243,7 +243,7 @@ async function findByFilename(
   ctx: RemoteContext,
   agent: "claude" | "codex",
   sessionId: string,
-): Promise<string | null> {
+): Promise<string[]> {
   const root = agent === "claude" ? `${ctx.home}/.claude/projects` : `${ctx.home}/.codex/sessions`;
   if (agent === "claude") {
     const output = await hostExec(
@@ -251,12 +251,16 @@ async function findByFilename(
       ctx.hostId,
       `r=${shellQuote(root)}; for f in "$r"/*/*.jsonl; do [ -f "$f" ] && printf '%s\\n' "$f"; done`,
     );
-    return (output ?? "").split("\n").find((p) => {
+    const seen = new Set<string>();
+    // Return every prefix match so the caller can report a clash; one id in two project dirs is one session.
+    return (output ?? "").split("\n").filter((p) => {
       const relative = p.slice(root.length + 1).split("/");
-      return p.startsWith(`${root}/`) && relative.length === 2 &&
-        relative[1]!.toLowerCase().startsWith(sessionId.toLowerCase()) &&
-        relative[1]!.endsWith(".jsonl");
-    }) ?? null;
+      const name = relative[1] ?? "";
+      if (!p.startsWith(`${root}/`) || relative.length !== 2 || !name.endsWith(".jsonl")) return false;
+      if (!name.toLowerCase().startsWith(sessionId.toLowerCase()) || seen.has(name)) return false;
+      seen.add(name);
+      return true;
+    });
   }
   try {
     const listing = await ctx.bb.sdk.files.list({
@@ -268,9 +272,9 @@ async function findByFilename(
     const hit = pathsOfListing(listing).find(
       (p) => p.endsWith(".jsonl") && p.toLowerCase().includes(sessionId.toLowerCase()),
     );
-    return hit ? `${root}/${hit}` : null;
+    return hit ? [`${root}/${hit}`] : [];
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -311,11 +315,11 @@ export async function findRemoteSession(
 
   for (const agent of ["claude", "codex"] as const) {
     if (!wanted(agent)) continue;
-    const path = await findByFilename(ctx, agent, sessionId);
-    if (path) {
+    for (const path of await findByFilename(ctx, agent, sessionId)) {
       found.push({
         agent,
-        sessionId,
+        // Claude names the file after the full id; record it, not the typed prefix.
+        sessionId: agent === "claude" ? path.slice(path.lastIndexOf("/") + 1, -".jsonl".length) : sessionId,
         filePath: path,
         modifiedAtMs: 0,
         sizeBytes: 0,
