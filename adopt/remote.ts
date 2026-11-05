@@ -234,15 +234,37 @@ function pathsOfListing(listing: unknown): string[] {
 }
 
 /**
- * Claude and Codex put the session id in the filename, so bb's remote fuzzy
- * file listing finds them without running anything on the machine.
+ * Claude transcripts live directly inside each project directory. A fuzzy
+ * search also matches the parent id in subagent paths and may omit the main
+ * transcript from its limited results, so enumerate only that store level.
+ * Codex rollouts retain their recursive, date-sharded lookup.
  */
 async function findByFilename(
   ctx: RemoteContext,
   agent: "claude" | "codex",
   sessionId: string,
-): Promise<string | null> {
+): Promise<string[]> {
   const root = agent === "claude" ? `${ctx.home}/.claude/projects` : `${ctx.home}/.codex/sessions`;
+  if (agent === "claude") {
+    // The id goes into the glob, so only matching transcripts are stat'ed and
+    // printed: a busy store holds tens of thousands. Quoted, it stays literal.
+    // Claude names files with lowercase ids.
+    const output = await hostExec(
+      ctx.bb,
+      ctx.hostId,
+      `r=${shellQuote(root)}; p=${shellQuote(sessionId.toLowerCase())}; for f in "$r"/*/"$p"*.jsonl; do [ -f "$f" ] && printf '%s\\n' "$f"; done`,
+    );
+    const seen = new Set<string>();
+    // Return every prefix match so the caller can report a clash; one id in two project dirs is one session.
+    return (output ?? "").split("\n").filter((p) => {
+      const relative = p.slice(root.length + 1).split("/");
+      const name = relative[1] ?? "";
+      if (!p.startsWith(`${root}/`) || relative.length !== 2 || !name.endsWith(".jsonl")) return false;
+      if (!name.toLowerCase().startsWith(sessionId.toLowerCase()) || seen.has(name)) return false;
+      seen.add(name);
+      return true;
+    });
+  }
   try {
     const listing = await ctx.bb.sdk.files.list({
       hostId: ctx.hostId,
@@ -253,9 +275,9 @@ async function findByFilename(
     const hit = pathsOfListing(listing).find(
       (p) => p.endsWith(".jsonl") && p.toLowerCase().includes(sessionId.toLowerCase()),
     );
-    return hit ? `${root}/${hit}` : null;
+    return hit ? [`${root}/${hit}`] : [];
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -296,11 +318,11 @@ export async function findRemoteSession(
 
   for (const agent of ["claude", "codex"] as const) {
     if (!wanted(agent)) continue;
-    const path = await findByFilename(ctx, agent, sessionId);
-    if (path) {
+    for (const path of await findByFilename(ctx, agent, sessionId)) {
       found.push({
         agent,
-        sessionId,
+        // Claude names the file after the full id; record it, not the typed prefix.
+        sessionId: agent === "claude" ? path.slice(path.lastIndexOf("/") + 1, -".jsonl".length) : sessionId,
         filePath: path,
         modifiedAtMs: 0,
         sizeBytes: 0,
