@@ -246,10 +246,13 @@ async function findByFilename(
 ): Promise<string[]> {
   const root = agent === "claude" ? `${ctx.home}/.claude/projects` : `${ctx.home}/.codex/sessions`;
   if (agent === "claude") {
+    // The id goes into the glob, so only matching transcripts are stat'ed and
+    // printed: a busy store holds tens of thousands. Quoted, it stays literal.
+    // Claude names files with lowercase ids.
     const output = await hostExec(
       ctx.bb,
       ctx.hostId,
-      `r=${shellQuote(root)}; for f in "$r"/*/*.jsonl; do [ -f "$f" ] && printf '%s\\n' "$f"; done`,
+      `r=${shellQuote(root)}; p=${shellQuote(sessionId.toLowerCase())}; for f in "$r"/*/"$p"*.jsonl; do [ -f "$f" ] && printf '%s\\n' "$f"; done`,
     );
     const seen = new Set<string>();
     // Return every prefix match so the caller can report a clash; one id in two project dirs is one session.

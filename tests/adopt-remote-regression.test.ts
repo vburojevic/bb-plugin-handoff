@@ -12,10 +12,12 @@ afterEach(() => roots.splice(0).forEach((root) => rmSync(root, { recursive: true
 
 function remote(home: string, entries: string[] = [], probe: string | null = home) {
   let output = "";
+  const outputs: string[] = [];
   const create = vi.fn(async ({ start }: { start: { command: string } }) => {
     // Execute the discovery script, but keep hostExec's temporary output in memory.
     const script = start.command.slice(2, start.command.indexOf(" ; } >"));
     output = script.includes('"$HOME"') ? (probe ?? "") : execFileSync("sh", ["-c", script], { encoding: "utf8" });
+    outputs.push(output);
     return { id: "terminal" };
   });
   const bb = { sdk: {
@@ -29,7 +31,7 @@ function remote(home: string, entries: string[] = [], probe: string | null = hom
       remove: async () => {},
     },
   } } as unknown as BbPluginApi;
-  return { bb, create, ctx: { bb, hostId: "remote", hostName: "laptop", home } };
+  return { bb, create, outputs, ctx: { bb, hostId: "remote", hostName: "laptop", home } };
 }
 
 const ID = "7862d82b-39fa-4c03-935a-fab4a4649621";
@@ -89,6 +91,19 @@ describe("remote Claude id prefixes", () => {
     const found = await findRemoteSession(remote(home).ctx, ID, "claude");
     expect(found).toHaveLength(1);
     expect(found[0]).toMatchObject({ sessionId: ID, filePath: join(home, ".claude/projects", `-work/${ID}.jsonl`) });
+  });
+
+  it("prints only the transcripts that match, not the whole store", async () => {
+    const others = Array.from({ length: 5 }, (_, i) => `-p${i}/0000000${i}-0000-4000-8000-000000000000.jsonl`);
+    const home = store([`-work/${ID}.jsonl`, ...others]);
+    const { ctx, outputs } = remote(home);
+    expect(await findRemoteSession(ctx, ID.slice(0, 8), "claude")).toHaveLength(1);
+    expect(outputs.at(-1)?.trim().split("\n")).toEqual([join(home, ".claude/projects", `-work/${ID}.jsonl`)]);
+  });
+
+  it("keeps glob characters in an id literal", async () => {
+    const home = store([`-work/${ID}.jsonl`]);
+    expect(await findRemoteSession(remote(home).ctx, "*", "claude")).toEqual([]);
   });
 
   it("treats one id in two project directories as one session", async () => {
