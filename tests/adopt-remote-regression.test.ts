@@ -141,11 +141,50 @@ describe("remote home discovery", () => {
       { sources: [{ hostId: "remote", path: "/home/fallback/work" }] },
     ] as Awaited<ReturnType<typeof bb.sdk.projects.list>>);
     expect(await listRemoteSessionsForDirectory(bb, { machine: "remote", cwd: "/work" })).toMatchObject({ sessions: [], machine: "laptop" });
-    expect(create.mock.calls.at(-1)?.[0].start.command).toContain("/home/fallback/.claude/projects");
+    expect(create.mock.calls.at(-1)?.[0].start.command).toContain("'/home/fallback/.claude' '/home/fallback'/.claude[-_.]?*");
   });
 
   it.each(["", "relative/path", "/home/user\nnoise"])("reports no-home for invalid probe output %j", async (probe) => {
     const { bb } = remote("/unused", [], probe);
     expect(await performAdoptRemote(bb, { machine: "remote", sessionId: ID, dryRun: true })).toMatchObject({ ok: false, code: "no-home" });
+  });
+});
+
+describe("remote Claude profiles", () => {
+  function homeWithProfile(profile: string) {
+    const home = mkdtempSync(join(tmpdir(), "handoff profile's-"));
+    roots.push(home);
+    const project = join(home, profile, "projects/-work");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, `${ID}.jsonl`), transcript(false));
+    return { home, file: join(project, `${ID}.jsonl`) };
+  }
+
+  it.each([".claude-work", ".claude.personal", ".claude_alt"])("finds a session by id under ~/%s", async (profile) => {
+    const { home, file } = homeWithProfile(profile);
+    const found = await findRemoteSession(remote(home).ctx, ID.slice(0, 8), "claude");
+    expect(found.map((session) => session.filePath)).toEqual([file]);
+  });
+
+  it("lists a profile's sessions for a directory", async () => {
+    const { home, file } = homeWithProfile(".claude-work");
+    const result = await listRemoteSessionsForDirectory(remote(home).bb, { machine: "remote", cwd: "/work", home });
+    expect(result).toMatchObject({ sessions: [{ agent: "claude", sessionId: ID, filePath: file }] });
+  });
+
+  it("ignores directories that only look like a profile", async () => {
+    const { home } = homeWithProfile(".claudette");
+    expect(await findRemoteSession(remote(home).ctx, ID, "claude")).toEqual([]);
+  });
+
+  it("reports one session when two profiles hold the same id", async () => {
+    const { home, file } = homeWithProfile(".claude");
+    const work = join(home, ".claude-work/projects/-work");
+    mkdirSync(work, { recursive: true });
+    writeFileSync(join(work, `${ID}.jsonl`), transcript(false));
+    expect((await findRemoteSession(remote(home).ctx, ID, "claude")).map((s) => s.filePath)).toEqual([file]);
+    const listed = await listRemoteSessionsForDirectory(remote(home).bb, { machine: "remote", cwd: "/work", home });
+    expect(listed).toMatchObject({ sessions: [{ filePath: file }] });
+    expect((listed as { sessions: unknown[] }).sessions).toHaveLength(1);
   });
 });

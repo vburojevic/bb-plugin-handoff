@@ -105,6 +105,21 @@ const STAT_PRELUDE =
 
 // --- Discovery --------------------------------------------------------------
 
+/**
+ * Claude Code's config directories on a machine, as shell words: the default
+ * `~/.claude`, then any sibling profile (`~/.claude-work`, `~/.claude.personal`),
+ * the same set `claudeProjectRoots` scans locally. Anyone who runs separate
+ * work and personal profiles keeps their sessions under the profile directory,
+ * where a lookup fixed on `~/.claude` never finds them. An unmatched glob stays
+ * literal, so every use checks that the directory exists.
+ */
+function claudeConfigDirs(home: string): string {
+  return `${shellQuote(`${home}/.claude`)} ${shellQuote(home)}/.claude[-_.]?*`;
+}
+
+/** `~/.claude` or a sibling profile directory, by name. */
+const CLAUDE_CONFIG_DIR = /^\.claude(?:[-_.].+)?$/;
+
 export interface RemoteListing {
   sessions: FoundSession[];
   /** Stores that could not be read, for honest "nothing found" messages. */
@@ -117,7 +132,7 @@ export interface RemoteListing {
  * date, is filtered by grepping each recent rollout's session_meta.
  */
 export function buildListScript(home: string, cwd: string, codexScanLimit = 400): string {
-  const claudeDir = `${home}/.claude/projects/${claudeProjectSlug(cwd)}`;
+  const claudeSlug = claudeProjectSlug(cwd);
   const geminiDir = geminiChatsDir(cwd, home);
   const codexDir = `${home}/.codex/sessions`;
   const db = opencodeDbPath(home);
@@ -125,7 +140,7 @@ export function buildListScript(home: string, cwd: string, codexScanLimit = 400)
   // "derive it from the path", which only Gemini cannot do.
   return [
     STAT_PRELUDE,
-    `d=${shellQuote(claudeDir)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'claude\\t\\t'; emit "$f"; }; done; fi`,
+    `for c in ${claudeConfigDirs(home)}; do d="$c/projects/"${shellQuote(claudeSlug)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'claude\\t\\t'; emit "$f"; }; done; fi; done`,
     `d=${shellQuote(geminiDir)}; if [ -d "$d" ]; then for f in "$d"/session-*.json; do [ -f "$f" ] || continue; i=$(head -c 400 "$f" | tr -d '\\n' | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1); printf 'gemini\\t%s\\t' "$i"; emit "$f"; done; fi`,
     `d=${shellQuote(codexDir)}; if [ -d "$d" ]; then find "$d" -type f -name 'rollout-*.jsonl' | sort -r | head -n ${codexScanLimit} | while read -r f; do head -c 65536 "$f" | grep -qF ${shellQuote(`"cwd":"${cwd}"`)} && { printf 'codex\\t\\t'; emit "$f"; }; done; fi`,
     `db=${shellQuote(db)}; if [ -f "$db" ] && command -v sqlite3 >/dev/null 2>&1; then printf 'opencode\\t\\t'; sqlite3 -readonly -json "$db" ${shellQuote(opencodeListSql(cwd))} | tr -d '\\n'; printf '\\n'; fi`,
@@ -188,9 +203,12 @@ export function parseListOutput(output: string, cwd: string): FoundSession[] {
     const size = Number(rest.slice(first + 1, second));
     const filePath = rest.slice(second + 1).trim();
     if (!filePath || !Number.isFinite(mtime)) continue;
+    const sessionId = emittedId || idFromPath(agent, filePath);
+    // The same Claude session can sit under two config dirs (a profile symlinked to ~/.claude).
+    if (agent === "claude" && sessions.some((s) => s.agent === "claude" && s.sessionId === sessionId)) continue;
     sessions.push({
       agent,
-      sessionId: emittedId || idFromPath(agent, filePath),
+      sessionId,
       filePath,
       modifiedAtMs: mtime * 1000,
       sizeBytes: Number.isFinite(size) ? size : 0,
@@ -252,14 +270,17 @@ async function findByFilename(
     const output = await hostExec(
       ctx.bb,
       ctx.hostId,
-      `r=${shellQuote(root)}; p=${shellQuote(sessionId.toLowerCase())}; for f in "$r"/*/"$p"*.jsonl; do [ -f "$f" ] && printf '%s\\n' "$f"; done`,
+      `p=${shellQuote(sessionId.toLowerCase())}; for c in ${claudeConfigDirs(ctx.home)}; do [ -d "$c/projects" ] || continue; for f in "$c/projects"/*/"$p"*.jsonl; do [ -f "$f" ] && printf '%s\\n' "$f"; done; done`,
     );
     const seen = new Set<string>();
-    // Return every prefix match so the caller can report a clash; one id in two project dirs is one session.
+    // Return every prefix match so the caller can report a clash; one id in two
+    // project dirs, or in two profiles, is one session.
     return (output ?? "").split("\n").filter((p) => {
-      const relative = p.slice(root.length + 1).split("/");
-      const name = relative[1] ?? "";
-      if (!p.startsWith(`${root}/`) || relative.length !== 2 || !name.endsWith(".jsonl")) return false;
+      // <home>/<config dir>/projects/<project dir>/<id>.jsonl
+      const relative = p.slice(ctx.home.length + 1).split("/");
+      const name = relative[3] ?? "";
+      if (!p.startsWith(`${ctx.home}/`) || relative.length !== 4 || !name.endsWith(".jsonl")) return false;
+      if (!CLAUDE_CONFIG_DIR.test(relative[0]!) || relative[1] !== "projects") return false;
       if (!name.toLowerCase().startsWith(sessionId.toLowerCase()) || seen.has(name)) return false;
       seen.add(name);
       return true;
