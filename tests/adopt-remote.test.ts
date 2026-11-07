@@ -31,7 +31,8 @@ describe("buildListScript", () => {
   });
 
   it("addresses Claude by the project slug", () => {
-    expect(script).toContain("'/Users/mini/.claude/projects/-Users-mini-Git-aurora'");
+    expect(script).toContain("'/Users/mini/.claude' '/Users/mini'/.claude[-_.]?*");
+    expect(script).toContain("'-Users-mini-Git-aurora'");
   });
 
   it("addresses Gemini by the cwd hash, not by scanning", () => {
