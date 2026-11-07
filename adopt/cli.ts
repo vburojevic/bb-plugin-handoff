@@ -61,7 +61,7 @@ function formatAge(ms: number): string {
 
 export const ADOPT_HELP = `bb handoff adopt — continue an external agent session as a bb thread
 
-Supports Claude Code, Codex, Gemini CLI, and OpenCode sessions.
+Supports Claude Code, Codex, Gemini CLI, OpenCode, and Pi sessions.
 
 Usage:
   bb handoff adopt <session-id | resume command>
@@ -72,8 +72,8 @@ Usage:
   bb handoff adopt --machine <host> --cwd <path>
       Adopt a session that lives on another enrolled machine; the thread runs
       on that machine in the session's directory. With --cwd and no id, the
-      newest session for that directory over there is adopted. All four agents
-      are supported: Claude Code and Codex are found by id alone, Gemini and
+      newest session for that directory over there is adopted. All five agents
+      are supported: Claude Code, Codex and Pi are found by id alone, Gemini and
       OpenCode need --cwd (or an exact id) since their ids are not in a path.
       --home overrides the remote home directory when it can't be derived.
 
@@ -86,7 +86,7 @@ Usage:
       Create a bb thread that continues a session. Defaults to the newest
       session for the directory across all agents. Options:
         --cwd <path>             Session working directory (default: invoking cwd)
-        --agent <name>           Only consider one agent: claude | codex | gemini | opencode
+        --agent <name>           Only consider one agent: claude | codex | gemini | opencode | pi
         --project <id>           Target bb project (default: match cwd, else create)
         --title <title>          Thread title
         --thread-provider <id>   bb provider for the new thread (default: same
@@ -111,9 +111,9 @@ export const adoptCommandSpecs = [
   {
     name: "adopt",
     summary:
-      "Adopt a session that ran outside bb (Claude Code, Codex, Gemini CLI, OpenCode) — on this machine or any enrolled one — as a bb thread; `adopt list` shows what is adoptable",
+      "Adopt a session that ran outside bb (Claude Code, Codex, Gemini CLI, OpenCode, Pi) — on this machine or any enrolled one — as a bb thread; `adopt list` shows what is adoptable",
     usage:
-      "bb handoff adopt [<session-id | resume command>] [--cwd <path>] [--agent claude|codex|gemini|opencode] [--machine <host>] [--home <path>] [--effort <level>] [--force] [--dry-run] [--json]  |  bb handoff adopt list [--machine <host>] [--cwd <path>] [--limit <n>]",
+      "bb handoff adopt [<session-id | resume command>] [--cwd <path>] [--agent claude|codex|gemini|opencode|pi] [--machine <host>] [--home <path>] [--effort <level>] [--force] [--dry-run] [--json]  |  bb handoff adopt list [--machine <host>] [--cwd <path>] [--limit <n>]",
   },
 ];
 

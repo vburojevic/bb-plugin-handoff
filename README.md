@@ -52,13 +52,13 @@ That's the whole idea, applied in both directions:
 |              | From                                                                 | To                                                        |
 | ------------ | -------------------------------------------------------------------- | --------------------------------------------------------- |
 | **Hand off** | a bb thread on any provider                                          | a new thread on any other provider, any enrolled machine |
-| **Adopt**    | a Claude Code, Codex, Gemini or OpenCode session in your terminal    | a bb thread in the same directory, with its history       |
+| **Adopt**    | a Claude Code, Codex, Gemini, OpenCode or Pi session in your terminal | a bb thread in the same directory, with its history       |
 
 ```mermaid
 flowchart LR
   T["bb thread<br>any provider"] -->|hand off| D["handoff document<br>transcript + working state"]
   D --> N["new bb thread<br>any provider, any machine"]
-  S["terminal session<br>Claude Code, Codex,<br>Gemini CLI, OpenCode"] -->|adopt| A["bb thread<br>same directory, full history"]
+  S["terminal session<br>Claude Code, Codex,<br>Gemini CLI, OpenCode, Pi"] -->|adopt| A["bb thread<br>same directory, full history"]
 ```
 
 ## Hand off: bb thread to any agent
@@ -156,6 +156,7 @@ On the new-thread screen, expand **Continue a session from another agent**. Past
 ```
 claude --resume 9ace2fd5-d8ae-4946-a0a0-9ff58a6795df
 codex resume 019fd95c-907f-7eb1-8dfc-2aad427ffc09
+pi --session 11111111-2222-4333-8444-555555555555
 ```
 
 Or just browse recent sessions per project and tap one.
@@ -166,13 +167,15 @@ Or just browse recent sessions per project and tap one.
 | Codex CLI   | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `codex`                               |
 | Gemini CLI  | `~/.gemini/tmp/<sha256(cwd)>/chats/*.json`     | `claude-code` (no bb Gemini provider) |
 | OpenCode    | `~/.local/share/opencode/opencode.db` (SQLite) | `acp-opencode`                        |
+| Pi          | `~/.pi/agent/sessions/--<cwd>--/*.jsonl`       | `pi`                                  |
 
 - **Claude Code profiles.** Claude Code's store moves with `CLAUDE_CONFIG_DIR`. Adoption reads the configured directory, the default `~/.claude`, and any sibling profile directory (`~/.claude-work`, `~/.claude-personal`), so sessions started under a non-default profile are adoptable too, on this machine and on another one.
+- **Pi sessions.** Adoption imports the last persisted branch, not abandoned alternatives. User and assistant text, tool-call summaries, compactions and branch summaries carry over; system prompts, thinking, tool output, image bytes and extension state do not. Context edits on that branch are honored, and the source files stay untouched. Local discovery respects `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR` in the **bb server process**. Remote discovery reads the default `~/.pi/agent/sessions` store; per-invocation `--session-dir` paths and Pi settings-file overrides are not discovered.
 - **Same directory.** The new thread starts **in the session's own directory**, so the files are exactly where you left them.
 - **Clean timeline.** The transcript rides along as agent-only context: your bb timeline stays clean, the agent gets the full history.
 - **Project matching.** The project is matched from the directory (longest project-source prefix). If nothing covers it, one is created.
 - **Live sessions.** A session with activity in the last ~10 minutes is flagged as "may still be running", both in the session list and to the new agent, which watches for concurrent edits.
-- **Other machines.** `--machine <host>` adopts from another enrolled machine and runs the thread over there. Claude and Codex resolve from a session id alone; Gemini and OpenCode need `--cwd`, since their ids live inside a file and a SQLite row. The panel has the same axis: a **From machine** picker appears once a second machine is enrolled. And `bb handoff adopt` run from a bb thread that lives on another machine follows that machine automatically: its directory is over there, so that is where the sessions are read.
+- **Other machines.** `--machine <host>` adopts from another enrolled machine and runs the thread over there. Claude, Codex and Pi resolve from a session id alone; Gemini and OpenCode need `--cwd`, since their ids live inside a file and a SQLite row. The panel has the same axis: a **From machine** picker appears once a second machine is enrolled. And `bb handoff adopt` run from a bb thread that lives on another machine follows that machine automatically: its directory is over there, so that is where the sessions are read.
 
 > [!TIP]
 > Agents get both directions through the bundled `handoff` skill. Asking an agent to "continue this in Codex" or "adopt my terminal session" is enough to trigger it.
@@ -203,6 +206,8 @@ bb handoff list [--json]                         # past handoffs (last 100)
 bb handoff adopt                                 # newest session for this directory
 bb handoff adopt 9ace2fd5                        # by id or prefix, any directory
 bb handoff adopt "claude --resume 9ace2fd5-…"    # or the whole resume command
+bb handoff adopt "pi --session 11111111-…"       # Pi ids and resume commands too
+bb handoff adopt list --agent pi --cwd <path>    # only Pi sessions
 bb handoff adopt list --cwd <path>               # what's adoptable here
 bb handoff adopt list --machine mini --cwd <path>   # …and over there
 ```
@@ -235,7 +240,7 @@ Adding an agent means implementing `AgentAdapter` from `adopt/transcript.ts` in 
 
 ```sh
 npm install
-npm test            # 179 unit tests: capture/render, transfer planning,
+npm test            # 205 unit tests: capture/render, transfer planning,
                     # adopt engine + adapters, remote store readers, CLI guards
 npm run typecheck
 bb plugin install . # register this checkout with your bb
@@ -252,7 +257,7 @@ The plugin builds against the [`@get-bb/plugin-sdk`](https://www.npmjs.com/packa
 
 - **Continuation is transcript-based**, not a native resume: the new thread is a fresh provider session seeded with the prior conversation. Work done in the old session *after* the handoff isn't carried over.
 - **Cross-machine carries a patch, not a workspace** (capped at 2 MB). When the changes don't fit, the patch keeps the files that fit whole and the document names the rest. Untracked build output, ignored files and anything outside the repo stay behind.
-- **Remote reads need the machine connected.** Discovery there runs one short-lived terminal (POSIX `sh`, `stat`, `find`, plus `sqlite3` for OpenCode). Without it, adoption by explicit session id still works for Claude and Codex through the file API alone.
+- **Remote reads need the machine connected.** Discovery there runs one short-lived terminal (POSIX `sh`, `stat`, `find`, plus `sqlite3` for OpenCode). Without it, adoption by explicit session id still works for Claude, Codex and Pi through the file API alone.
 - **Remote listings are directory-scoped** (`--cwd` is required, since the invoking directory is a path on *this* machine) and show no titles, since reading one would cost a round trip per session.
 - **Transcripts are size-capped** (adopt: 150k chars by default).
 - **Not adoptable:** agents that don't persist full transcripts locally. Amp keeps threads server-side, and Cursor keeps them in app-internal databases.
