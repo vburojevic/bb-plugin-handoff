@@ -9,7 +9,7 @@
 Hand a bb thread off to Codex, Claude Code, Kimi, opencode, Cursor…<br>
 or adopt a terminal session that never ran in bb at all.
 
-[![bb ≥ 0.36](https://img.shields.io/badge/bb-%E2%89%A5%200.36-1f2430?style=flat-square)](https://getbb.app)
+[![bb ≥ 0.49](https://img.shields.io/badge/bb-%E2%89%A5%200.49-1f2430?style=flat-square)](https://getbb.app)
 [![license MIT](https://img.shields.io/badge/license-MIT-1f2430?style=flat-square)](LICENSE)
 
 </div>
@@ -159,7 +159,7 @@ codex resume 019fd95c-907f-7eb1-8dfc-2aad427ffc09
 bb plugin install git:https://github.com/vburojevic/bb-plugin-handoff.git
 ```
 
-Requires bb ≥ 0.36. No keys, no configuration, no external services — it only
+Requires bb ≥ 0.49. No keys, no configuration, no external services — it only
 talks to your own bb and the session files already on your disks.
 
 ## CLI

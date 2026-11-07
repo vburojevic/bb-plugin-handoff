@@ -5,13 +5,14 @@
 // installed provider (Codex, Claude Code, Cursor, …) seeded with it.
 // In ("adopt", see adopt/): take a session that ran OUTSIDE bb — Claude Code,
 // Codex, or Gemini CLI — and continue it as a bb thread.
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { adoptCommandSpecs, runAdoptCli } from "./adopt/cli";
 import { adoptRpcShape, createAdoptRpcHandlers } from "./adopt/rpc";
 import { captureThread } from "./capture";
 import { providerIconTint } from "./lib/provider-icon";
 import {
+  blockBriefing,
   listHandoffs,
   REASONING_LEVELS,
   renderHandoff,
@@ -221,6 +222,11 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`verification settle failed: ${error instanceof Error ? error.message : error}`);
     });
   });
+  // A source agent that stops for an approval or a question cannot finish its
+  // briefing turn without the user, so the handoff stops waiting right away.
+  bb.events.on("interaction.pending", ({ thread }) => {
+    blockBriefing(thread.id);
+  });
 
   bb.rpc.register(rpcContract, {
     ...createAdoptRpcHandlers(bb),
@@ -320,9 +326,9 @@ export default async function plugin(bb: BbPluginApi) {
           model: model.model,
           displayName: model.displayName,
           isDefault: model.isDefault,
-          defaultReasoningEffort: model.defaultReasoningEffort,
+          defaultReasoningEffort: reasoningLevelSchema.parse(model.defaultReasoningEffort),
           supportedReasoningEfforts: model.supportedReasoningEfforts.map((effort) => ({
-            reasoningEffort: effort.reasoningEffort,
+            reasoningEffort: reasoningLevelSchema.parse(effort.reasoningEffort),
             description: effort.description,
           })),
         })),

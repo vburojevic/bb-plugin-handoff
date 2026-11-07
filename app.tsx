@@ -12,7 +12,7 @@ import {
   useBbNavigate,
   useRealtime,
   useRpc,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server";
 import { AdoptSection } from "./adopt/section";
@@ -291,7 +291,7 @@ interface HandoffScope {
   messageRole: "user" | "assistant";
 }
 
-/** Parse the params a messageAction's openPanel call handed this tab. */
+/** Parse the params the "Hand off from here" message action opened this tab with. */
 function parseScope(params: unknown): HandoffScope | null {
   if (!params || typeof params !== "object") return null;
   const record = params as Record<string, unknown>;
@@ -1171,7 +1171,9 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
 }
 
 export default definePluginApp((app) => {
-  app.slots.threadPanelAction({
+  app.slots.experimental_tab({
+    context: { kind: "thread" },
+    availability: "action",
     id: "handoff",
     title: "Hand off",
     icon: "ArrowTurnForward",
@@ -1182,9 +1184,9 @@ export default definePluginApp((app) => {
     id: "handoff-from-here",
     title: "Hand off from here",
     icon: "ArrowTurnForward",
-    run: ({ message, openPanel }) => {
-      const opened = openPanel({
-        actionId: "handoff",
+    run: ({ message, experimental_panel }) => {
+      const opened = experimental_panel.openTab({
+        tab: { id: "handoff", context: { kind: "thread" }, availability: "action" },
         title: "Hand off",
         params: {
           upToSeq: message.sourceSeqEnd,

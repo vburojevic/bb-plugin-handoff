@@ -13,12 +13,6 @@
       "node"
     ],
     "paths": {
-      "@bb/plugin-sdk": [
-        "./types/bb-plugin-sdk.d.ts"
-      ],
-      "@bb/plugin-sdk/app": [
-        "./types/bb-plugin-sdk-app.d.ts"
-      ],
       "@/*": [
         "./*"
       ]
@@ -33,7 +27,6 @@
     "capture.ts",
     "handoff.ts",
     "tests",
-    "types",
     "components",
     "lib",
     "hooks"

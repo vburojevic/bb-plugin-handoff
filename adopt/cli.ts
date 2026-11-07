@@ -1,6 +1,6 @@
 // `bb handoff adopt …` — the CLI surface of the adopt direction: continue an
 // external agent session (Claude Code, Codex, Gemini CLI) as a bb thread.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { deriveHomeDir } from "../capture";
 import { REASONING_LEVELS, type ReasoningLevel } from "../handoff";
 import {

@@ -1,7 +1,7 @@
 // Shared adoption engine used by both the CLI command and the frontend RPC.
 import * as fs from "node:fs";
 import * as os from "node:os";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { deriveHomeDir } from "../capture";
 import type { ReasoningLevel } from "../handoff";
 import { listMachines, matchMachine } from "../machines";

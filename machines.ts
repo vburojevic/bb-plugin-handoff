@@ -2,7 +2,8 @@
 // so moving a session to another one is three decisions: which host, which
 // workspace on that host, and what working state has to travel alongside the
 // transcript because the git remote does not carry it.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { z } from "zod";
 
 export type WorkspaceMode = "reuse" | "checkout" | "worktree" | "personal";
 
@@ -295,6 +296,47 @@ export interface WorkingState {
 export const MAX_PATCH_BYTES = 2_000_000;
 
 /**
+ * bb's bundled Git plugin owns workspace git reads. These are the parts of its
+ * `workspaceStatus` and `diff` results this plugin reads (`bb plugin rpc
+ * inspect bb--git` prints the full contract).
+ */
+const GIT_PLUGIN_ID = "bb--git";
+
+const gitUnavailableSchema = z.union([
+  z.object({ outcome: z.literal("not_applicable"), message: z.string() }),
+  z.object({ outcome: z.literal("unavailable"), failure: z.object({ message: z.string() }) }),
+]);
+
+const gitWorkspaceStatusSchema = z.union([
+  z.object({
+    outcome: z.literal("available"),
+    workspace: z.object({
+      workingTree: z.object({
+        files: z.array(z.object({ path: z.string(), status: z.string() })),
+        hasUncommittedChanges: z.boolean(),
+        insertions: z.number(),
+        deletions: z.number(),
+      }),
+      checkout: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("branch"), branchName: z.string(), headSha: z.string().nullable() }),
+        z.object({ kind: z.literal("detached"), headSha: z.string().nullable() }),
+        z.object({ kind: z.literal("unborn"), branchName: z.string().nullable() }),
+        z.object({ kind: z.literal("unknown") }),
+      ]),
+    }),
+  }),
+  gitUnavailableSchema,
+]);
+
+const gitDiffSchema = z.union([
+  z.object({
+    outcome: z.literal("available"),
+    diff: z.object({ diff: z.string(), truncated: z.boolean() }),
+  }),
+  gitUnavailableSchema,
+]);
+
+/**
  * The source workspace's git state, including a patch of everything
  * uncommitted. Cross-machine handoffs need this because the target machine
  * only ever sees what has been pushed.
@@ -303,9 +345,14 @@ export async function captureWorkingState(
   bb: BbPluginApi,
   environmentId: string,
 ): Promise<WorkingState | null> {
-  let status: Awaited<ReturnType<typeof bb.sdk.environments.status>>;
+  let status: z.infer<typeof gitWorkspaceStatusSchema>;
   try {
-    status = await bb.sdk.environments.status({ environmentId });
+    status = await bb.sdk.plugins.callRpc({
+      pluginId: GIT_PLUGIN_ID,
+      method: "workspaceStatus",
+      input: { environmentId },
+      outputSchema: gitWorkspaceStatusSchema,
+    });
   } catch {
     return null;
   }
@@ -331,28 +378,19 @@ export async function captureWorkingState(
   if (!state.dirty) return state;
 
   try {
-    const result = await bb.sdk.environments.diffPatch({
-      environmentId,
-      target: { type: "uncommitted" },
-      paths: files.map((file) => file.path),
+    const result = await bb.sdk.plugins.callRpc({
+      pluginId: GIT_PLUGIN_ID,
+      method: "diff",
+      input: { environmentId, target: { type: "uncommitted" }, maxDiffBytes: MAX_PATCH_BYTES },
+      outputSchema: gitDiffSchema,
     });
     if (result.outcome !== "available") {
       state.note = "message" in result ? result.message : result.failure.message;
       return state;
     }
-    const chunks: string[] = [];
-    let bytes = 0;
-    for (const entry of result.patches) {
-      const text = entry.patch.endsWith("\n") ? entry.patch : `${entry.patch}\n`;
-      if (bytes + text.length > MAX_PATCH_BYTES) {
-        state.patchTruncated = true;
-        break;
-      }
-      chunks.push(text);
-      bytes += text.length;
-      if (entry.truncated) state.patchTruncated = true;
-    }
-    state.patch = chunks.length > 0 ? chunks.join("") : null;
+    const { diff, truncated } = result.diff;
+    state.patch = diff.length > 0 ? (diff.endsWith("\n") ? diff : `${diff}\n`) : null;
+    state.patchTruncated = truncated;
     if (state.patch === null) state.note = "No diff could be produced for the uncommitted files.";
   } catch (error) {
     state.note = error instanceof Error ? error.message : String(error);

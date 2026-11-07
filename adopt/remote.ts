@@ -7,7 +7,7 @@
 // stores that are addressable by path (Claude, Gemini), greps Codex rollouts
 // for the working directory, and queries OpenCode's SQLite — all writing one
 // TSV stream that the file API reads back.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { claudeProjectSlug } from "../capture";
 import { parseClaudeContent } from "./agents/claude";
 import { parseCodexContent } from "./agents/codex";
