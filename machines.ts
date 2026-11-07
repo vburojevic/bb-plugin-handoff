@@ -349,9 +349,27 @@ export function wholeFilesOnly(diff: string): string {
   return lastFile === -1 ? "" : diff.slice(0, lastFile + 1);
 }
 
+/**
+ * How git writes a path in a diff header: as is, or C-quoted with octal escapes
+ * when it holds a quote, a backslash, a control character or a non-ASCII byte.
+ */
+function gitHeaderPath(path: string): string {
+  if (!/["\\\x00-\x1f\x7f-\uffff]/.test(path)) return path;
+  const named: Record<number, string> = { 7: "a", 8: "b", 9: "t", 10: "n", 11: "v", 12: "f", 13: "r", 34: '"', 92: "\\" };
+  let out = "";
+  for (const byte of new TextEncoder().encode(path)) {
+    if (named[byte]) out += `\\${named[byte]}`;
+    else if (byte < 0x20 || byte >= 0x7f) out += `\\${byte.toString(8).padStart(3, "0")}`;
+    else out += String.fromCharCode(byte);
+  }
+  return `"${out}"`;
+}
+
 /** Whether a unified diff has a section for this path. */
 function patchCovers(patch: string, path: string): boolean {
-  return patch.includes(`diff --git a/${path} b/`) || patch.includes(` b/${path}\n`);
+  const a = gitHeaderPath(`a/${path}`);
+  const b = gitHeaderPath(`b/${path}`);
+  return patch.includes(`diff --git ${a} `) || patch.includes(` ${b}\n`);
 }
 
 /**
@@ -408,7 +426,10 @@ export async function captureWorkingState(
       return state;
     }
     const { diff, truncated } = result.diff;
-    const kept = truncated ? wholeFilesOnly(diff) : diff;
+    // `truncated` also covers capped file lists, where the diff itself is
+    // whole. Only a diff that reached the byte limit was cut mid-hunk.
+    const cut = truncated && new TextEncoder().encode(diff).byteLength >= MAX_PATCH_BYTES - 4;
+    const kept = cut ? wholeFilesOnly(diff) : diff;
     state.patch = kept.length > 0 ? (kept.endsWith("\n") ? kept : `${kept}\n`) : null;
     state.patchTruncated = truncated;
     if (truncated) {
