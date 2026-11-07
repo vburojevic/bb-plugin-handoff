@@ -307,6 +307,7 @@ const CLEAN: WorkingState = {
   deletions: 0,
   patch: null,
   patchTruncated: false,
+  patchOmitted: [],
   note: null,
 };
 
@@ -340,15 +341,20 @@ describe("renderHandoff wording", () => {
       working: {
         ...CLEAN,
         dirty: true,
-        files: [{ path: "src/a.ts", status: "M" }],
         insertions: 9,
         deletions: 1,
+        files: [
+          { path: "src/a.ts", status: "M" },
+          { path: "assets/big.json", status: "??" },
+        ],
         patch: "diff",
         patchTruncated: true,
+        patchOmitted: ["assets/big.json"],
       },
       patchPath: "/tmp/p.patch",
     });
-    expect(doc).toContain("truncated to fit, so it is incomplete");
+    expect(doc).toContain("the patch holds only the files that fit whole");
+    expect(doc).toContain("Left out: assets/big.json");
   });
 
   it("surfaces planning notes in the document itself", () => {

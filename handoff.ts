@@ -312,7 +312,7 @@ function renderWorkingState(
       `git apply --3way ${patchPath}`,
       "```",
       "",
-      `Read the patch before applying it, and check \`git status\` afterwards. If it does not apply cleanly your checkout is at a different commit — reconcile before continuing rather than forcing it.${working.patchTruncated ? " NOTE: the patch was truncated to fit, so it is incomplete — treat it as a guide, not the whole change." : ""}`,
+      `Read the patch before applying it, and check \`git status\` afterwards. If it does not apply cleanly your checkout is at a different commit — reconcile before continuing rather than forcing it.${working.patchTruncated ? ` NOTE: the changes did not fit the size limit, so the patch holds only the files that fit whole.${working.patchOmitted.length > 0 ? ` Left out: ${working.patchOmitted.slice(0, 20).join(", ")}${working.patchOmitted.length > 20 ? ` and ${working.patchOmitted.length - 20} more` : ""}. Those changes exist only on the source machine.` : ""}` : ""}`,
       "",
     );
   } else {
