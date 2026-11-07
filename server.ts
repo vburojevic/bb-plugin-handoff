@@ -10,6 +10,7 @@ import { z } from "zod";
 import { adoptCommandSpecs, runAdoptCli } from "./adopt/cli";
 import { adoptRpcShape, createAdoptRpcHandlers } from "./adopt/rpc";
 import { captureThread } from "./capture";
+import { knownModelOptions } from "./lib/model-options";
 import { providerIconTint } from "./lib/provider-icon";
 import {
   blockBriefing,
@@ -125,7 +126,8 @@ export const rpcContract = defineRpcContract({
           displayName: z.string(),
           /** The model the provider picks when the handoff names none. */
           isDefault: z.boolean(),
-          defaultReasoningEffort: reasoningLevelSchema,
+          /** null when the provider's default is a level this plugin does not know yet. */
+          defaultReasoningEffort: reasoningLevelSchema.nullable(),
           supportedReasoningEfforts: z.array(
             z.object({ reasoningEffort: reasoningLevelSchema, description: z.string() }),
           ),
@@ -321,18 +323,7 @@ export default async function plugin(bb: BbPluginApi) {
             ? { environmentId, providerId }
             : { providerId },
       );
-      return {
-        models: options.models.map((model) => ({
-          model: model.model,
-          displayName: model.displayName,
-          isDefault: model.isDefault,
-          defaultReasoningEffort: reasoningLevelSchema.parse(model.defaultReasoningEffort),
-          supportedReasoningEfforts: model.supportedReasoningEfforts.map((effort) => ({
-            reasoningEffort: reasoningLevelSchema.parse(effort.reasoningEffort),
-            description: effort.description,
-          })),
-        })),
-      };
+      return { models: knownModelOptions(options.models) };
     },
     async startHandoff({
       threadId,

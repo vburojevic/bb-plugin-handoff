@@ -270,7 +270,7 @@ type ModelOption = {
   model: string;
   displayName: string;
   isDefault: boolean;
-  defaultReasoningEffort: ReasoningLevel;
+  defaultReasoningEffort: ReasoningLevel | null;
   supportedReasoningEfforts: { reasoningEffort: ReasoningLevel; description: string }[];
 };
 
