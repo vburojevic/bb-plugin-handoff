@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import {
-  BRIEFING_POLL_MS,
+  blockBriefing,
   HISTORY_LIMIT,
   settleBriefing,
   settleVerification,
@@ -78,8 +78,10 @@ function makeFakeBb(
           record("threads.send", args);
           if (options.briefingAsksQuestion) {
             // The agent stops to ask instead of answering: the thread stays
-            // active, so no idle ever arrives for this turn.
+            // active, so no idle ever arrives for this turn. bb announces the
+            // question with interaction.pending, which server.ts forwards.
             blocked = true;
+            queueMicrotask(() => blockBriefing("thr_src"));
             return;
           }
           // The briefing turn "completes" right after the send resolves.
@@ -87,25 +89,10 @@ function makeFakeBb(
             settleBriefing("thr_src", options.briefingReply ?? "Briefing: step one is done."),
           );
         },
-        interactions: {
-          list: async (args: unknown) => {
-            record("threads.interactions.list", args);
-            return blocked
-              ? [
-                  {
-                    id: "int_1",
-                    threadId: "thr_src",
-                    status: "pending",
-                    payload: { kind: "user_question" },
-                  },
-                ]
-              : [];
-          },
-        },
         events: {
-          list: async (args: unknown) => {
+          list: async (args: { afterSeq?: string }) => {
             record("threads.events.list", args);
-            return events;
+            return events.filter((event) => event.seq > Number(args.afterSeq ?? 0));
           },
         },
         output: async (args: unknown) => {
@@ -198,6 +185,20 @@ describe("startHandoff", () => {
       .filter((call) => call.method === "realtime:handoff:progress")
       .map((call) => (call.args as { stage: string }).stage);
     expect(stages).toEqual(["capturing", "rendering", "uploading", "spawning", "done"]);
+  });
+
+  it("spawns a personal-workspace handoff in bb's personal project", async () => {
+    const { bb, calls } = makeFakeBb();
+    await startHandoff(bb, { sourceThreadId: "thr_src", providerId: "codex", workspace: "personal" });
+    const upload = calls.find((call) => call.method === "attachments.upload")!.args as { projectId: string };
+    const spawn = calls.find((call) => call.method === "threads.spawn")!.args as {
+      projectId: string;
+      environment: { type: string; workspace: { type: string } };
+    };
+    expect(spawn.environment.workspace).toEqual({ type: "personal" });
+    expect(spawn.projectId).toBe("proj_personal");
+    // bb only lets a thread attach a document uploaded to its own project.
+    expect(upload.projectId).toBe("proj_personal");
   });
 
   it("passes the requested thinking effort to the target thread", async () => {
@@ -392,13 +393,11 @@ describe("startHandoff", () => {
         workspace: "reuse",
         briefing: true,
       });
-      // Well short of BRIEFING_TIMEOUT_MS: the point is that it does not sit
-      // there for the full 90s waiting on a turn that cannot finish.
-      for (let tick = 0; tick < 5; tick++) await vi.advanceTimersByTimeAsync(BRIEFING_POLL_MS);
+      // No timer is advanced: the handoff must not sit there for the full
+      // BRIEFING_TIMEOUT_MS waiting on a turn that cannot finish.
       const result = await running;
 
       expect(result.briefing).toBe("skipped-blocked");
-      expect(calls.some((call) => call.method === "threads.interactions.list")).toBe(true);
       // The question is the user's to answer — the handoff only reports it.
       expect(calls.some((call) => call.method.startsWith("threads.interactions.cancel"))).toBe(false);
 

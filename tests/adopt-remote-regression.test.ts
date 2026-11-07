@@ -1,0 +1,215 @@
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { findRemoteSession, readRemoteSession } from "../adopt/remote";
+import { listRemoteSessionsForDirectory, performAdoptRemote } from "../adopt/adopt-core";
+
+const LOGIN_SHELL = existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh";
+
+/** The script hostExec hands to /bin/sh, with the outer quoting undone. */
+function innerScript(command: string): string {
+  return execFileSync("/bin/sh", ["-c", `printf %s ${command.slice("/bin/sh -c ".length)}`], { encoding: "utf8" });
+}
+
+const roots: string[] = [];
+afterEach(() => roots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
+
+function remote(home: string, entries: string[] = [], probe: string | null = home) {
+  let output = "";
+  const outputs: string[] = [];
+  const create = vi.fn(async ({ start }: { start: { command: string } }) => {
+    if (start.command.includes('"$HOME"')) {
+      output = probe ?? "";
+    } else {
+      // Run the command the way bb's host daemon does: through the login shell,
+      // which on macOS is zsh, where an unmatched glob is an error.
+      execFileSync(LOGIN_SHELL, ["-c", start.command], { encoding: "utf8" });
+      const out = /\/tmp\/bb-handoff-remote-\d+-\d+\.out/.exec(start.command)![0];
+      output = readFileSync(out, "utf8");
+      rmSync(out, { force: true });
+    }
+    outputs.push(output);
+    return { id: "terminal" };
+  });
+  const bb = { sdk: {
+    hosts: { list: async () => [{ id: "remote", name: "laptop", status: "connected" }] },
+    system: { config: async () => ({ primaryHostId: "server" }) },
+    projects: { list: async () => [] },
+    terminals: { create, get: async () => ({ status: "exited" }), close: async () => {} },
+    files: {
+      list: async ({ limit }: { limit: number }) => entries.slice(0, limit),
+      read: async ({ path }: { path: string }) => ({ content: path.startsWith("/tmp/bb-handoff-remote-") ? output : readFileSync(path, "utf8"), contentEncoding: "utf8" }),
+      remove: async () => {},
+    },
+  } } as unknown as BbPluginApi;
+  return { bb, create, outputs, ctx: { bb, hostId: "remote", hostName: "laptop", home } };
+}
+
+const ID = "7862d82b-39fa-4c03-935a-fab4a4649621";
+function transcript(sidechain: boolean) {
+  return ["user", "assistant"].map((type) => JSON.stringify({ type, sessionId: ID, cwd: "/work", isSidechain: sidechain, message: { role: type, content: "hello" } })).join("\n");
+}
+
+describe("remote Claude lookup", () => {
+  it("selects the main transcript even when more than five subagents match first", async () => {
+    const home = mkdtempSync(join(tmpdir(), "handoff remote's-"));
+    roots.push(home);
+    const project = join(home, ".claude/projects/-work");
+    mkdirSync(join(project, ID, "subagents"), { recursive: true });
+    const entries = Array.from({ length: 8 }, (_, i) => `-work/${ID}/subagents/agent-${i}.jsonl`);
+    for (const entry of entries) writeFileSync(join(home, ".claude/projects", entry), transcript(true));
+    writeFileSync(join(project, `${ID}.jsonl`), transcript(false));
+    entries.push(`-work/${ID}.jsonl`);
+    const { ctx } = remote(home, entries);
+    const found = await findRemoteSession(ctx, ID, "claude");
+    expect(found[0]?.filePath).toBe(join(project, `${ID}.jsonl`));
+    expect(await readRemoteSession(ctx, found[0]!)).toMatchObject({ userMessageCount: 1, assistantMessageCount: 1 });
+    expect((await findRemoteSession(ctx, ID.slice(0, 8), "claude"))[0]?.filePath).toBe(join(project, `${ID}.jsonl`));
+  });
+
+  it("does not adopt an orphan subagent as its parent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "handoff-orphan-"));
+    roots.push(home);
+    const nested = `-work/${ID}/subagents/agent-one.jsonl`;
+    mkdirSync(join(home, ".claude/projects", `-work/${ID}/subagents`), { recursive: true });
+    writeFileSync(join(home, ".claude/projects", nested), transcript(true));
+    expect(await findRemoteSession(remote(home, [nested]).ctx, ID, "claude")).toEqual([]);
+  });
+});
+
+describe("remote Claude id prefixes", () => {
+  const OTHER = "7862d82b-0000-4000-8000-000000000000";
+  function store(files: string[]) {
+    const home = mkdtempSync(join(tmpdir(), "handoff-prefix-"));
+    roots.push(home);
+    for (const file of files) {
+      mkdirSync(join(home, ".claude/projects", file, ".."), { recursive: true });
+      writeFileSync(join(home, ".claude/projects", file), transcript(false));
+    }
+    return home;
+  }
+
+  it("reports every session that shares a prefix, with its full id", async () => {
+    const home = store([`-work/${ID}.jsonl`, `-other/${OTHER}.jsonl`]);
+    const found = await findRemoteSession(remote(home).ctx, "7862d82b", "claude");
+    expect(found.map((f) => f.sessionId).sort()).toEqual([OTHER, ID].sort());
+    const result = await performAdoptRemote(remote(home).bb, { machine: "remote", sessionId: "7862d82b", agent: "claude", dryRun: true });
+    expect(result).toMatchObject({ ok: false, code: "ambiguous" });
+  });
+
+  it("selects one session by full id when another shares its prefix", async () => {
+    const home = store([`-work/${ID}.jsonl`, `-other/${OTHER}.jsonl`]);
+    const found = await findRemoteSession(remote(home).ctx, ID, "claude");
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ sessionId: ID, filePath: join(home, ".claude/projects", `-work/${ID}.jsonl`) });
+  });
+
+  it("prints only the transcripts that match, not the whole store", async () => {
+    const others = Array.from({ length: 5 }, (_, i) => `-p${i}/0000000${i}-0000-4000-8000-000000000000.jsonl`);
+    const home = store([`-work/${ID}.jsonl`, ...others]);
+    const { ctx, outputs } = remote(home);
+    expect(await findRemoteSession(ctx, ID.slice(0, 8), "claude")).toHaveLength(1);
+    expect(outputs.at(-1)?.trim().split("\n")).toEqual([join(home, ".claude/projects", `-work/${ID}.jsonl`)]);
+  });
+
+  it("keeps glob characters in an id literal", async () => {
+    const home = store([`-work/${ID}.jsonl`]);
+    expect(await findRemoteSession(remote(home).ctx, "*", "claude")).toEqual([]);
+  });
+
+  it("treats one id in two project directories as one session", async () => {
+    const home = store([`-a/${ID}.jsonl`, `-b/${ID}.jsonl`]);
+    expect(await findRemoteSession(remote(home).ctx, ID.slice(0, 8), "claude")).toHaveLength(1);
+  });
+});
+
+describe("remote home discovery", () => {
+  it("lists sessions without a project source or explicit home", async () => {
+    const home = mkdtempSync(join(tmpdir(), "handoff-home-"));
+    roots.push(home);
+    const { bb } = remote(home);
+    expect(await listRemoteSessionsForDirectory(bb, { machine: "remote", cwd: "/work" })).toMatchObject({ sessions: [], machine: "laptop" });
+  });
+
+  it("uses the same home discovery for adoption by id", async () => {
+    const home = mkdtempSync(join(tmpdir(), "handoff-home-"));
+    roots.push(home);
+    const { bb } = remote(home);
+    const result = await performAdoptRemote(bb, { machine: "remote", sessionId: ID, agent: "claude", dryRun: true });
+    expect(result).toMatchObject({ ok: false, code: "not-found" });
+  });
+
+  it("honors an explicit home without probing HOME", async () => {
+    const { bb, create } = remote("/nonexistent", [], "/different");
+    await listRemoteSessionsForDirectory(bb, { machine: "remote", cwd: "/work", home: "/nonexistent" });
+    expect(create.mock.calls.every(([args]) => !args.start.command.includes('"$HOME"'))).toBe(true);
+  });
+
+  it.each([false, true])("falls back to project sources when the HOME probe fails (terminal failure: %s)", async (terminalFailure) => {
+    const { bb, create } = remote("/unused", [], "relative/path");
+    if (terminalFailure) create.mockRejectedValueOnce(new Error("terminal unavailable"));
+    vi.spyOn(bb.sdk.projects, "list").mockResolvedValue([
+      { sources: [{ hostId: "remote", path: "/home/fallback/work" }] },
+    ] as Awaited<ReturnType<typeof bb.sdk.projects.list>>);
+    expect(await listRemoteSessionsForDirectory(bb, { machine: "remote", cwd: "/work" })).toMatchObject({ sessions: [], machine: "laptop" });
+    expect(innerScript(create.mock.calls.at(-1)![0].start.command)).toContain("'/home/fallback/.claude' '/home/fallback'/.claude[-_.]?*");
+  });
+
+  it.each(["", "relative/path", "/home/user\nnoise"])("reports no-home for invalid probe output %j", async (probe) => {
+    const { bb } = remote("/unused", [], probe);
+    expect(await performAdoptRemote(bb, { machine: "remote", sessionId: ID, dryRun: true })).toMatchObject({ ok: false, code: "no-home" });
+  });
+});
+
+describe("remote Claude profiles", () => {
+  it("runs its scripts in sh, so a profile-less home works under a zsh login shell", async () => {
+    const home = mkdtempSync(join(tmpdir(), "handoff zsh's-"));
+    roots.push(home);
+    const project = join(home, ".claude/projects/-work");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, `${ID}.jsonl`), transcript(false));
+    const { ctx, create } = remote(home);
+    expect((await findRemoteSession(ctx, ID, "claude")).map((s) => s.filePath)).toEqual([join(project, `${ID}.jsonl`)]);
+    expect(create.mock.calls.at(-1)![0].start.command.startsWith("/bin/sh -c '")).toBe(true);
+  });
+
+  function homeWithProfile(profile: string) {
+    const home = mkdtempSync(join(tmpdir(), "handoff profile's-"));
+    roots.push(home);
+    const project = join(home, profile, "projects/-work");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, `${ID}.jsonl`), transcript(false));
+    return { home, file: join(project, `${ID}.jsonl`) };
+  }
+
+  it.each([".claude-work", ".claude.personal", ".claude_alt"])("finds a session by id under ~/%s", async (profile) => {
+    const { home, file } = homeWithProfile(profile);
+    const found = await findRemoteSession(remote(home).ctx, ID.slice(0, 8), "claude");
+    expect(found.map((session) => session.filePath)).toEqual([file]);
+  });
+
+  it("lists a profile's sessions for a directory", async () => {
+    const { home, file } = homeWithProfile(".claude-work");
+    const result = await listRemoteSessionsForDirectory(remote(home).bb, { machine: "remote", cwd: "/work", home });
+    expect(result).toMatchObject({ sessions: [{ agent: "claude", sessionId: ID, filePath: file }] });
+  });
+
+  it("ignores directories that only look like a profile", async () => {
+    const { home } = homeWithProfile(".claudette");
+    expect(await findRemoteSession(remote(home).ctx, ID, "claude")).toEqual([]);
+  });
+
+  it("reports one session when two profiles hold the same id", async () => {
+    const { home, file } = homeWithProfile(".claude");
+    const work = join(home, ".claude-work/projects/-work");
+    mkdirSync(work, { recursive: true });
+    writeFileSync(join(work, `${ID}.jsonl`), transcript(false));
+    expect((await findRemoteSession(remote(home).ctx, ID, "claude")).map((s) => s.filePath)).toEqual([file]);
+    const listed = await listRemoteSessionsForDirectory(remote(home).bb, { machine: "remote", cwd: "/work", home });
+    expect(listed).toMatchObject({ sessions: [{ filePath: file }] });
+    expect((listed as { sessions: unknown[] }).sessions).toHaveLength(1);
+  });
+});

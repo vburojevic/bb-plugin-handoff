@@ -9,7 +9,7 @@
 Hand a bb thread off to Codex, Claude Code, Kimi, opencode, Cursor…<br>
 or adopt a terminal session that never ran in bb at all.
 
-[![bb ≥ 0.36](https://img.shields.io/badge/bb-%E2%89%A5%200.36-1f2430?style=flat-square)](https://getbb.app)
+[![bb ≥ 0.49](https://img.shields.io/badge/bb-%E2%89%A5%200.49-1f2430?style=flat-square)](https://getbb.app)
 [![license MIT](https://img.shields.io/badge/license-MIT-1f2430?style=flat-square)](LICENSE)
 
 </div>
@@ -132,6 +132,10 @@ pi --session 11111111-2222-4333-8444-555555555555
 | OpenCode    | `~/.local/share/opencode/opencode.db` (SQLite) | `acp-opencode`                        |
 | Pi          | `~/.pi/agent/sessions/--<cwd>--/*.jsonl`        | `pi`                                  |
 
+- Claude Code's store moves with `CLAUDE_CONFIG_DIR`. Adoption reads the
+  configured directory, the default `~/.claude`, and any sibling profile
+  directory (`~/.claude-work`, `~/.claude-personal`), so sessions started
+  under a non-default profile are adoptable too.
 - The new thread starts **in the session's own directory**, so the files are
   exactly where you left them.
 - Pi imports the last persisted branch, not abandoned alternatives. User and
@@ -165,7 +169,7 @@ pi --session 11111111-2222-4333-8444-555555555555
 bb plugin install git:https://github.com/vburojevic/bb-plugin-handoff.git
 ```
 
-Requires bb ≥ 0.36. No keys, no configuration, no external services — it only
+Requires bb ≥ 0.49. No keys, no configuration, no external services — it only
 talks to your own bb and the session files already on your disks.
 
 ## CLI

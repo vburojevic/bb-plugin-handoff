@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { piSessionSlug } from "../adopt/agents/pi";
 import { buildListScript, findRemoteSession, parseListOutput, readRemoteSession, REMOTE_AGENTS, shellQuote } from "../adopt/remote";
@@ -37,7 +37,8 @@ describe("buildListScript", () => {
   });
 
   it("addresses Claude by the project slug", () => {
-    expect(script).toContain("'/Users/mini/.claude/projects/-Users-mini-Git-aurora'");
+    expect(script).toContain("'/Users/mini/.claude' '/Users/mini'/.claude[-_.]?*");
+    expect(script).toContain("'-Users-mini-Git-aurora'");
   });
 
   it("addresses Gemini by the cwd hash, not by scanning", () => {

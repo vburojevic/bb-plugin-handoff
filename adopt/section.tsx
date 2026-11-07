@@ -5,7 +5,7 @@
 // the session across every agent's store. Secondary flow: browse recent
 // sessions per project/directory and tap one to adopt it.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
+import { useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "../server";
 import { Badge } from "@/components/ui/badge";

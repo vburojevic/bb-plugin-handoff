@@ -12,7 +12,7 @@ import {
   useBbNavigate,
   useRealtime,
   useRpc,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server";
 import { AdoptSection } from "./adopt/section";
@@ -42,6 +42,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { providerMarkStyle, type ProviderIconTint } from "@/lib/provider-icon";
 import { omitUndefined } from "@/lib/rpc-input";
 import { cn } from "@/lib/utils";
 
@@ -73,6 +74,7 @@ interface TargetProvider {
   displayName: string;
   available: boolean;
   logoUrl: string | null;
+  iconTint?: ProviderIconTint | null;
 }
 
 interface HandoffRow {
@@ -202,12 +204,19 @@ function timeAgo(at: number): string {
 
 function ProviderMark({ provider, className }: { provider: TargetProvider; className?: string }) {
   if (provider.logoUrl) {
+    // A mask, not an <img>: the logo is drawn in currentColor, which an <img>
+    // resolves to black, invisible on a dark theme (lib/provider-icon.ts).
     return (
-      <img
-        src={provider.logoUrl}
-        alt=""
-        className={cn("shrink-0 rounded-md border border-border bg-background object-contain p-1", className)}
-      />
+      <span
+        aria-hidden
+        className={cn("flex shrink-0 rounded-md border border-border bg-background p-1", className)}
+      >
+        <span
+          data-provider-mark=""
+          className="size-full"
+          style={providerMarkStyle(provider.logoUrl, provider.iconTint ?? null)}
+        />
+      </span>
     );
   }
   return (
@@ -261,7 +270,7 @@ type ModelOption = {
   model: string;
   displayName: string;
   isDefault: boolean;
-  defaultReasoningEffort: ReasoningLevel;
+  defaultReasoningEffort: ReasoningLevel | null;
   supportedReasoningEfforts: { reasoningEffort: ReasoningLevel; description: string }[];
 };
 
@@ -282,7 +291,7 @@ interface HandoffScope {
   messageRole: "user" | "assistant";
 }
 
-/** Parse the params a messageAction's openPanel call handed this tab. */
+/** Parse the params the "Hand off from here" message action opened this tab with. */
 function parseScope(params: unknown): HandoffScope | null {
   if (!params || typeof params !== "object") return null;
   const record = params as Record<string, unknown>;
@@ -1162,7 +1171,9 @@ function HandoffPanel({ threadId, params }: { threadId: string; params?: unknown
 }
 
 export default definePluginApp((app) => {
-  app.slots.threadPanelAction({
+  app.slots.experimental_tab({
+    context: { kind: "thread" },
+    availability: "action",
     id: "handoff",
     title: "Hand off",
     icon: "ArrowTurnForward",
@@ -1173,9 +1184,9 @@ export default definePluginApp((app) => {
     id: "handoff-from-here",
     title: "Hand off from here",
     icon: "ArrowTurnForward",
-    run: ({ message, openPanel }) => {
-      const opened = openPanel({
-        actionId: "handoff",
+    run: ({ message, experimental_panel }) => {
+      const opened = experimental_panel.openTab({
+        tab: { id: "handoff", context: { kind: "thread" }, availability: "action" },
         title: "Hand off",
         params: {
           upToSeq: message.sourceSeqEnd,

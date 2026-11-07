@@ -2,7 +2,8 @@
 // so moving a session to another one is three decisions: which host, which
 // workspace on that host, and what working state has to travel alongside the
 // transcript because the git remote does not carry it.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { z } from "zod";
 
 export type WorkspaceMode = "reuse" | "checkout" | "worktree" | "personal";
 
@@ -286,13 +287,90 @@ export interface WorkingState {
   deletions: number;
   /** Unified diff of everything uncommitted; null when clean or unavailable. */
   patch: string | null;
+  /** The diff did not fit, so the patch holds only the files that fit whole. */
   patchTruncated: boolean;
+  /** Uncommitted files left out of a truncated patch. */
+  patchOmitted: string[];
   /** Why there is no patch, when there is uncommitted work but no diff. */
   note: string | null;
 }
 
 /** A patch beyond this is not worth shipping through a handoff. */
 export const MAX_PATCH_BYTES = 2_000_000;
+
+/**
+ * bb's bundled Git plugin owns workspace git reads. These are the parts of its
+ * `workspaceStatus` and `diff` results this plugin reads (`bb plugin rpc
+ * inspect bb--git` prints the full contract).
+ */
+const GIT_PLUGIN_ID = "bb--git";
+
+const gitUnavailableSchema = z.union([
+  z.object({ outcome: z.literal("not_applicable"), message: z.string() }),
+  z.object({ outcome: z.literal("unavailable"), failure: z.object({ message: z.string() }) }),
+]);
+
+const gitWorkspaceStatusSchema = z.union([
+  z.object({
+    outcome: z.literal("available"),
+    workspace: z.object({
+      workingTree: z.object({
+        files: z.array(z.object({ path: z.string(), status: z.string() })),
+        hasUncommittedChanges: z.boolean(),
+        insertions: z.number(),
+        deletions: z.number(),
+      }),
+      checkout: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("branch"), branchName: z.string(), headSha: z.string().nullable() }),
+        z.object({ kind: z.literal("detached"), headSha: z.string().nullable() }),
+        z.object({ kind: z.literal("unborn"), branchName: z.string().nullable() }),
+        z.object({ kind: z.literal("unknown") }),
+      ]),
+    }),
+  }),
+  gitUnavailableSchema,
+]);
+
+const gitDiffSchema = z.union([
+  z.object({
+    outcome: z.literal("available"),
+    diff: z.object({ diff: z.string(), truncated: z.boolean() }),
+  }),
+  gitUnavailableSchema,
+]);
+
+/**
+ * A diff cut at a byte limit ends mid-hunk, and `git apply` rejects the whole
+ * patch over one broken hunk. Keep only the file sections before the cut, so
+ * the patch still applies and carries every file that fit.
+ */
+export function wholeFilesOnly(diff: string): string {
+  const lastFile = diff.lastIndexOf("\ndiff --git ");
+  return lastFile === -1 ? "" : diff.slice(0, lastFile + 1);
+}
+
+/**
+ * How git writes a path in a diff header: as is, or C-quoted with octal escapes
+ * when it holds a quote, a backslash, a control character or a non-ASCII byte.
+ */
+function gitHeaderPath(path: string): string {
+  if (!/["\\\x00-\x1f\x7f-\uffff]/.test(path)) return path;
+  const named: Record<number, string> = { 7: "a", 8: "b", 9: "t", 10: "n", 11: "v", 12: "f", 13: "r", 34: '"', 92: "\\" };
+  let out = "";
+  for (const byte of new TextEncoder().encode(path)) {
+    if (named[byte]) out += `\\${named[byte]}`;
+    else if (byte < 0x20 || byte >= 0x7f) out += `\\${byte.toString(8).padStart(3, "0")}`;
+    else out += String.fromCharCode(byte);
+  }
+  return `"${out}"`;
+}
+
+/** Whether a unified diff has a section for this path. */
+function patchCovers(patch: string, path: string): boolean {
+  const a = gitHeaderPath(`a/${path}`);
+  const b = gitHeaderPath(`b/${path}`);
+  return patch.includes(`diff --git ${a} `) || patch.includes(` ${b}\n`);
+}
 
 /**
  * The source workspace's git state, including a patch of everything
@@ -303,9 +381,14 @@ export async function captureWorkingState(
   bb: BbPluginApi,
   environmentId: string,
 ): Promise<WorkingState | null> {
-  let status: Awaited<ReturnType<typeof bb.sdk.environments.status>>;
+  let status: z.infer<typeof gitWorkspaceStatusSchema>;
   try {
-    status = await bb.sdk.environments.status({ environmentId });
+    status = await bb.sdk.plugins.callRpc({
+      pluginId: GIT_PLUGIN_ID,
+      method: "workspaceStatus",
+      input: { environmentId },
+      outputSchema: gitWorkspaceStatusSchema,
+    });
   } catch {
     return null;
   }
@@ -326,34 +409,37 @@ export async function captureWorkingState(
     deletions: workingTree.deletions,
     patch: null,
     patchTruncated: false,
+    patchOmitted: [],
     note: null,
   };
   if (!state.dirty) return state;
 
   try {
-    const result = await bb.sdk.environments.diffPatch({
-      environmentId,
-      target: { type: "uncommitted" },
-      paths: files.map((file) => file.path),
+    const result = await bb.sdk.plugins.callRpc({
+      pluginId: GIT_PLUGIN_ID,
+      method: "diff",
+      input: { environmentId, target: { type: "uncommitted" }, maxDiffBytes: MAX_PATCH_BYTES },
+      outputSchema: gitDiffSchema,
     });
     if (result.outcome !== "available") {
       state.note = "message" in result ? result.message : result.failure.message;
       return state;
     }
-    const chunks: string[] = [];
-    let bytes = 0;
-    for (const entry of result.patches) {
-      const text = entry.patch.endsWith("\n") ? entry.patch : `${entry.patch}\n`;
-      if (bytes + text.length > MAX_PATCH_BYTES) {
-        state.patchTruncated = true;
-        break;
-      }
-      chunks.push(text);
-      bytes += text.length;
-      if (entry.truncated) state.patchTruncated = true;
+    const { diff, truncated } = result.diff;
+    // `truncated` also covers capped file lists, where the diff itself is
+    // whole. Only a diff that reached the byte limit was cut mid-hunk.
+    const cut = truncated && new TextEncoder().encode(diff).byteLength >= MAX_PATCH_BYTES - 4;
+    const kept = cut ? wholeFilesOnly(diff) : diff;
+    state.patch = kept.length > 0 ? (kept.endsWith("\n") ? kept : `${kept}\n`) : null;
+    state.patchTruncated = truncated;
+    if (truncated) {
+      state.patchOmitted = files.map((file) => file.path).filter((path) => !patchCovers(kept, path));
     }
-    state.patch = chunks.length > 0 ? chunks.join("") : null;
-    if (state.patch === null) state.note = "No diff could be produced for the uncommitted files.";
+    if (state.patch === null) {
+      state.note = truncated
+        ? `The uncommitted changes are larger than the ${MAX_PATCH_BYTES / 1_000_000} MB patch limit.`
+        : "No diff could be produced for the uncommitted files.";
+    }
   } catch (error) {
     state.note = error instanceof Error ? error.message : String(error);
   }

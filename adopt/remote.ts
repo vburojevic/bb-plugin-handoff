@@ -7,7 +7,7 @@
 // stores that are addressable by path (Claude, Gemini), greps Codex rollouts
 // for the working directory, and queries OpenCode's SQLite — all writing one
 // TSV stream that the file API reads back.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { claudeProjectSlug } from "../capture";
 import { parseClaudeContent } from "./agents/claude";
 import { parseCodexContent } from "./agents/codex";
@@ -64,7 +64,10 @@ export async function hostExec(
 ): Promise<string | null> {
   execCounter += 1;
   const out = `/tmp/bb-handoff-remote-${Date.now()}-${execCounter}.out`;
-  const command = `{ ${script} ; } > ${shellQuote(`${out}.part`)} 2>/dev/null; mv ${shellQuote(`${out}.part`)} ${shellQuote(out)}`;
+  // bb runs a terminal command through the machine's login shell, and on
+  // macOS that is zsh, where a glob that matches nothing aborts the script.
+  // These scripts are POSIX sh, so run them in sh whatever the login shell is.
+  const command = `/bin/sh -c ${shellQuote(`{ ${script} ; } > ${shellQuote(`${out}.part`)} 2>/dev/null; mv ${shellQuote(`${out}.part`)} ${shellQuote(out)}`)}`;
   let terminalId: string | null = null;
   try {
     const terminal = await bb.sdk.terminals.create({
@@ -106,6 +109,21 @@ const STAT_PRELUDE =
 
 // --- Discovery --------------------------------------------------------------
 
+/**
+ * Claude Code's config directories on a machine, as shell words: the default
+ * `~/.claude`, then any sibling profile (`~/.claude-work`, `~/.claude.personal`),
+ * the same set `claudeProjectRoots` scans locally. Anyone who runs separate
+ * work and personal profiles keeps their sessions under the profile directory,
+ * where a lookup fixed on `~/.claude` never finds them. An unmatched glob stays
+ * literal, so every use checks that the directory exists.
+ */
+function claudeConfigDirs(home: string): string {
+  return `${shellQuote(`${home}/.claude`)} ${shellQuote(home)}/.claude[-_.]?*`;
+}
+
+/** `~/.claude` or a sibling profile directory, by name. */
+const CLAUDE_CONFIG_DIR = /^\.claude(?:[-_.].+)?$/;
+
 export interface RemoteListing {
   sessions: FoundSession[];
   /** Stores that could not be read, for honest "nothing found" messages. */
@@ -118,7 +136,7 @@ export interface RemoteListing {
  * date, is filtered by grepping each recent rollout's session_meta.
  */
 export function buildListScript(home: string, cwd: string, codexScanLimit = 400): string {
-  const claudeDir = `${home}/.claude/projects/${claudeProjectSlug(cwd)}`;
+  const claudeSlug = claudeProjectSlug(cwd);
   const geminiDir = geminiChatsDir(cwd, home);
   const codexDir = `${home}/.codex/sessions`;
   const piDir = `${home}/.pi/agent/sessions/${piSessionSlug(cwd)}`;
@@ -128,7 +146,7 @@ export function buildListScript(home: string, cwd: string, codexScanLimit = 400)
   return [
     STAT_PRELUDE,
     `d=${shellQuote(piDir)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'pi\\t\\t'; emit "$f"; }; done; fi`,
-    `d=${shellQuote(claudeDir)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'claude\\t\\t'; emit "$f"; }; done; fi`,
+    `for c in ${claudeConfigDirs(home)}; do d="$c/projects/"${shellQuote(claudeSlug)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'claude\\t\\t'; emit "$f"; }; done; fi; done`,
     `d=${shellQuote(geminiDir)}; if [ -d "$d" ]; then for f in "$d"/session-*.json; do [ -f "$f" ] || continue; i=$(head -c 400 "$f" | tr -d '\\n' | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1); printf 'gemini\\t%s\\t' "$i"; emit "$f"; done; fi`,
     `d=${shellQuote(codexDir)}; if [ -d "$d" ]; then find "$d" -type f -name 'rollout-*.jsonl' | sort -r | head -n ${codexScanLimit} | while read -r f; do head -c 65536 "$f" | grep -qF ${shellQuote(`"cwd":"${cwd}"`)} && { printf 'codex\\t\\t'; emit "$f"; }; done; fi`,
     `db=${shellQuote(db)}; if [ -f "$db" ] && command -v sqlite3 >/dev/null 2>&1; then printf 'opencode\\t\\t'; sqlite3 -readonly -json "$db" ${shellQuote(opencodeListSql(cwd))} | tr -d '\\n'; printf '\\n'; fi`,
@@ -192,9 +210,12 @@ export function parseListOutput(output: string, cwd: string): FoundSession[] {
     const size = Number(rest.slice(first + 1, second));
     const filePath = rest.slice(second + 1).trim();
     if (!filePath || !Number.isFinite(mtime)) continue;
+    const sessionId = emittedId || idFromPath(agent, filePath);
+    // The same Claude session can sit under two config dirs (a profile symlinked to ~/.claude).
+    if (agent === "claude" && sessions.some((s) => s.agent === "claude" && s.sessionId === sessionId)) continue;
     sessions.push({
       agent,
-      sessionId: emittedId || idFromPath(agent, filePath),
+      sessionId,
       filePath,
       modifiedAtMs: mtime * 1000,
       sizeBytes: Number.isFinite(size) ? size : 0,
@@ -238,15 +259,40 @@ function pathsOfListing(listing: unknown): string[] {
 }
 
 /**
- * Claude and Codex put the session id in the filename, so bb's remote fuzzy
- * file listing finds them without running anything on the machine.
+ * Claude transcripts live directly inside each project directory. A fuzzy
+ * search also matches the parent id in subagent paths and may omit the main
+ * transcript from its limited results, so enumerate only that store level.
+ * Codex rollouts retain their recursive, date-sharded lookup.
  */
 async function findByFilename(
   ctx: RemoteContext,
   agent: "claude" | "codex",
   sessionId: string,
-): Promise<string | null> {
+): Promise<string[]> {
   const root = agent === "claude" ? `${ctx.home}/.claude/projects` : `${ctx.home}/.codex/sessions`;
+  if (agent === "claude") {
+    // The id goes into the glob, so only matching transcripts are stat'ed and
+    // printed: a busy store holds tens of thousands. Quoted, it stays literal.
+    // Claude names files with lowercase ids.
+    const output = await hostExec(
+      ctx.bb,
+      ctx.hostId,
+      `p=${shellQuote(sessionId.toLowerCase())}; for c in ${claudeConfigDirs(ctx.home)}; do [ -d "$c/projects" ] || continue; for f in "$c/projects"/*/"$p"*.jsonl; do [ -f "$f" ] && printf '%s\\n' "$f"; done; done`,
+    );
+    const seen = new Set<string>();
+    // Return every prefix match so the caller can report a clash; one id in two
+    // project dirs, or in two profiles, is one session.
+    return (output ?? "").split("\n").filter((p) => {
+      // <home>/<config dir>/projects/<project dir>/<id>.jsonl
+      const relative = p.slice(ctx.home.length + 1).split("/");
+      const name = relative[3] ?? "";
+      if (!p.startsWith(`${ctx.home}/`) || relative.length !== 4 || !name.endsWith(".jsonl")) return false;
+      if (!CLAUDE_CONFIG_DIR.test(relative[0]!) || relative[1] !== "projects") return false;
+      if (!name.toLowerCase().startsWith(sessionId.toLowerCase()) || seen.has(name)) return false;
+      seen.add(name);
+      return true;
+    });
+  }
   try {
     const listing = await ctx.bb.sdk.files.list({
       hostId: ctx.hostId,
@@ -257,9 +303,9 @@ async function findByFilename(
     const hit = pathsOfListing(listing).find(
       (p) => p.endsWith(".jsonl") && p.toLowerCase().includes(sessionId.toLowerCase()),
     );
-    return hit ? `${root}/${hit}` : null;
+    return hit ? [`${root}/${hit}`] : [];
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -300,11 +346,11 @@ export async function findRemoteSession(
 
   for (const agent of ["claude", "codex"] as const) {
     if (!wanted(agent)) continue;
-    const path = await findByFilename(ctx, agent, sessionId);
-    if (path) {
+    for (const path of await findByFilename(ctx, agent, sessionId)) {
       found.push({
         agent,
-        sessionId,
+        // Claude names the file after the full id; record it, not the typed prefix.
+        sessionId: agent === "claude" ? path.slice(path.lastIndexOf("/") + 1, -".jsonl".length) : sessionId,
         filePath: path,
         modifiedAtMs: 0,
         sizeBytes: 0,

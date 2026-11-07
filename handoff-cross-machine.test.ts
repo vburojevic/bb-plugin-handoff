@@ -2,7 +2,7 @@
 // is a lie: the files the agent reads about are on a disk it cannot see. These
 // tests pin down what travels and what the document promises.
 import { describe, expect, it } from "vitest";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { CapturedSession } from "./capture";
 import { renderHandoff, startHandoff } from "./handoff";
 import type { TransferPlan, WorkingState } from "./machines";
@@ -55,27 +55,40 @@ function makeFakeBb(options: { dirty?: boolean; patchWritable?: boolean } = {}) 
       },
       environments: {
         get: async () => ({ hostId: MAC.id, path: "/Users/dev/Git/aurora", branchName: "feature-x" }),
-        status: async () => ({
-          outcome: "available",
-          workspace: {
-            workingTree: {
-              insertions: options.dirty ? 40 : 0,
-              deletions: options.dirty ? 4 : 0,
-              files,
-              hasUncommittedChanges: Boolean(options.dirty),
-              state: options.dirty ? "dirty_uncommitted" : "clean",
-            },
-            checkout: { kind: "branch", branchName: "feature-x", headSha: "abc123def4567890" },
-          },
-        }),
-        diffPatch: async (args: unknown) => {
-          record("environments.diffPatch", args);
-          return {
+      },
+      plugins: {
+        callRpc: async (args: {
+          pluginId: string;
+          method: string;
+          input: unknown;
+          outputSchema: { parse(value: unknown): unknown };
+        }) => {
+          record(`${args.pluginId}.${args.method}`, args.input);
+          if (args.method === "workspaceStatus") {
+            return args.outputSchema.parse({
+              outcome: "available",
+              workspace: {
+                workingTree: {
+                  insertions: options.dirty ? 40 : 0,
+                  deletions: options.dirty ? 4 : 0,
+                  files,
+                  hasUncommittedChanges: Boolean(options.dirty),
+                  state: options.dirty ? "dirty_uncommitted" : "clean",
+                },
+                checkout: { kind: "branch", branchName: "feature-x", headSha: "abc123def4567890" },
+              },
+            });
+          }
+          return args.outputSchema.parse({
             outcome: "available",
-            patches: [
-              { path: "src/exporter.ts", patch: "--- a/src/exporter.ts\n+++ b/src/exporter.ts\n", truncated: false },
-            ],
-          };
+            diff: {
+              diff: "--- a/src/exporter.ts\n+++ b/src/exporter.ts\n",
+              truncated: false,
+              shortstat: " 1 file changed, 40 insertions(+), 4 deletions(-)",
+              files: "src/exporter.ts",
+              mergeBaseRef: null,
+            },
+          });
         },
       },
       files: {
@@ -116,13 +129,14 @@ function makeFakeBb(options: { dirty?: boolean; patchWritable?: boolean } = {}) 
   // The event pager expects threads.events.list; keep it separate for clarity.
   // deno-lint-ignore no-explicit-any
   (bb.sdk.threads as any).events = {
-    list: async () => [
-      {
-        seq: 1,
-        type: "item/completed",
-        data: { item: { type: "userMessage", id: "u1", content: [{ type: "text", text: "Stream it" }] } },
-      },
-    ],
+    list: async ({ afterSeq }: { afterSeq?: string }) =>
+      [
+        {
+          seq: 1,
+          type: "item/completed",
+          data: { item: { type: "userMessage", id: "u1", content: [{ type: "text", text: "Stream it" }] } },
+        },
+      ].filter((event) => event.seq > Number(afterSeq ?? 0)),
   };
   return { bb: bb as unknown as BbPluginApi, calls, kv };
 }
@@ -222,7 +236,7 @@ describe("startHandoff across machines", () => {
     });
     expect(result.crossMachine).toBe(false);
     expect(calls.some((call) => call.method === "files.write")).toBe(false);
-    expect(calls.some((call) => call.method === "environments.diffPatch")).toBe(false);
+    expect(calls.some((call) => call.method.startsWith("bb--git."))).toBe(false);
   });
 
   it("refuses to reuse the source environment on another machine", async () => {
@@ -293,6 +307,7 @@ const CLEAN: WorkingState = {
   deletions: 0,
   patch: null,
   patchTruncated: false,
+  patchOmitted: [],
   note: null,
 };
 
@@ -326,15 +341,20 @@ describe("renderHandoff wording", () => {
       working: {
         ...CLEAN,
         dirty: true,
-        files: [{ path: "src/a.ts", status: "M" }],
         insertions: 9,
         deletions: 1,
+        files: [
+          { path: "src/a.ts", status: "M" },
+          { path: "assets/big.json", status: "??" },
+        ],
         patch: "diff",
         patchTruncated: true,
+        patchOmitted: ["assets/big.json"],
       },
       patchPath: "/tmp/p.patch",
     });
-    expect(doc).toContain("truncated to fit, so it is incomplete");
+    expect(doc).toContain("the patch holds only the files that fit whole");
+    expect(doc).toContain("Left out: assets/big.json");
   });
 
   it("surfaces planning notes in the document itself", () => {

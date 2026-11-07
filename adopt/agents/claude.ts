@@ -1,4 +1,4 @@
-// Claude Code sessions: ~/.claude/projects/<cwd-slug>/<session-id>.jsonl
+// Claude Code sessions: <config-dir>/projects/<cwd-slug>/<session-id>.jsonl
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,9 +16,52 @@ import {
   type SessionSummary,
 } from "../transcript";
 
-function projectDir(cwd: string, home: string): string {
+/** Profile directories sit next to the default one: `.claude-work`, `.claude.personal`. */
+const PROFILE_DIR = /^\.claude[-_.].+/;
+
+function claudeProfileDirs(home: string): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(home, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((entry) => PROFILE_DIR.test(entry.name) && (entry.isDirectory() || entry.isSymbolicLink()))
+    .map((entry) => path.join(home, entry.name))
+    .sort();
+}
+
+/**
+ * Every Claude Code session store worth reading, most specific first.
+ *
+ * Claude Code keeps sessions under its config directory. That is `~/.claude` by
+ * default, but CLAUDE_CONFIG_DIR moves it, and anyone running separate work and
+ * personal profiles sets it per shell — their sessions are then in `~/.claude-work`
+ * and invisible to a lookup hardcoded on `~/.claude`.
+ *
+ * Reading the variable is necessary but not sufficient: bb's server does not
+ * inherit the shell a session was started from, so a profile directory that no
+ * live environment points at can only be found by looking for it. Hence the
+ * sibling scan, which costs one readdir of the home directory.
+ */
+export function claudeProjectRoots(home: string = os.homedir()): string[] {
+  const roots: string[] = [];
+  const add = (configDir: string): void => {
+    const root = path.join(configDir, "projects");
+    if (!roots.includes(root)) roots.push(root);
+  };
+  for (const dir of (process.env.CLAUDE_CONFIG_DIR ?? "").split(path.delimiter)) {
+    if (dir.trim()) add(path.resolve(dir.trim()));
+  }
+  add(path.join(home, ".claude"));
+  for (const dir of claudeProfileDirs(home)) add(dir);
+  return roots;
+}
+
+function projectDirs(cwd: string, home: string): string[] {
   const slug = cwd.replace(/[^a-zA-Z0-9]/g, "-");
-  return path.join(home, ".claude", "projects", slug);
+  return claudeProjectRoots(home).map((root) => path.join(root, slug));
 }
 
 /** The session's cwd is recorded on its message rows. */
@@ -74,47 +117,16 @@ export const claudeAdapter: AgentAdapter = {
   bbProviderId: "claude-code",
 
   async list(cwd: string, home: string = os.homedir()): Promise<SessionSummary[]> {
-    const dir = projectDir(cwd, home);
     const out: SessionSummary[] = [];
-    for (const entry of await fs.promises.readdir(dir).catch(() => [])) {
-      if (!entry.endsWith(".jsonl")) continue;
-      const filePath = path.join(dir, entry);
-      let stat: fs.Stats;
-      try {
-        stat = await fs.promises.stat(filePath);
-      } catch {
-        continue;
-      }
-      if (!stat.isFile() || stat.size === 0) continue;
-      out.push({
-        agent: "claude",
-        sessionId: entry.slice(0, -".jsonl".length),
-        filePath,
-        modifiedAtMs: stat.mtimeMs,
-        sizeBytes: stat.size,
-        title: await titleCache.get(filePath, stat.mtimeMs, () => peekTitle(filePath)),
-      });
-    }
-    out.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
-    return out;
-  },
-
-  async find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): Promise<FoundSession[]> {
-    const home = options.home ?? os.homedir();
-    const root = path.join(home, ".claude", "projects");
-    const needle = idOrPrefix.toLowerCase();
-    const out: FoundSession[] = [];
-    for (const dir of await fs.promises.readdir(root).catch(() => [])) {
-      const dirPath = path.join(root, dir);
-      let entries: string[];
-      try {
-        entries = await fs.promises.readdir(dirPath);
-      } catch {
-        continue;
-      }
-      for (const entry of entries) {
-        if (!entry.endsWith(".jsonl") || !entry.toLowerCase().startsWith(needle)) continue;
-        const filePath = path.join(dirPath, entry);
+    // One id can surface twice when two config directories are symlinked
+    // together; the first root wins, so the most specific one does.
+    const seen = new Set<string>();
+    for (const dir of projectDirs(cwd, home)) {
+      for (const entry of await fs.promises.readdir(dir).catch(() => [])) {
+        if (!entry.endsWith(".jsonl")) continue;
+        const sessionId = entry.slice(0, -".jsonl".length);
+        if (seen.has(sessionId)) continue;
+        const filePath = path.join(dir, entry);
         let stat: fs.Stats;
         try {
           stat = await fs.promises.stat(filePath);
@@ -122,15 +134,58 @@ export const claudeAdapter: AgentAdapter = {
           continue;
         }
         if (!stat.isFile() || stat.size === 0) continue;
+        seen.add(sessionId);
         out.push({
           agent: "claude",
-          sessionId: entry.slice(0, -".jsonl".length),
+          sessionId,
           filePath,
           modifiedAtMs: stat.mtimeMs,
           sizeBytes: stat.size,
           title: await titleCache.get(filePath, stat.mtimeMs, () => peekTitle(filePath)),
-          cwd: await cwdCache.get(filePath, stat.mtimeMs, () => peekCwd(filePath)),
         });
+      }
+    }
+    out.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
+    return out;
+  },
+
+  async find(idOrPrefix: string, options: { home?: string; cwdCandidates?: string[] } = {}): Promise<FoundSession[]> {
+    const home = options.home ?? os.homedir();
+    const needle = idOrPrefix.toLowerCase();
+    const out: FoundSession[] = [];
+    const seen = new Set<string>();
+    for (const root of claudeProjectRoots(home)) {
+      for (const dir of await fs.promises.readdir(root).catch(() => [])) {
+        const dirPath = path.join(root, dir);
+        let entries: string[];
+        try {
+          entries = await fs.promises.readdir(dirPath);
+        } catch {
+          continue;
+        }
+        for (const entry of entries) {
+          if (!entry.endsWith(".jsonl") || !entry.toLowerCase().startsWith(needle)) continue;
+          const sessionId = entry.slice(0, -".jsonl".length);
+          if (seen.has(sessionId)) continue;
+          const filePath = path.join(dirPath, entry);
+          let stat: fs.Stats;
+          try {
+            stat = await fs.promises.stat(filePath);
+          } catch {
+            continue;
+          }
+          if (!stat.isFile() || stat.size === 0) continue;
+          seen.add(sessionId);
+          out.push({
+            agent: "claude",
+            sessionId,
+            filePath,
+            modifiedAtMs: stat.mtimeMs,
+            sizeBytes: stat.size,
+            title: await titleCache.get(filePath, stat.mtimeMs, () => peekTitle(filePath)),
+            cwd: await cwdCache.get(filePath, stat.mtimeMs, () => peekCwd(filePath)),
+          });
+        }
       }
     }
     out.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
