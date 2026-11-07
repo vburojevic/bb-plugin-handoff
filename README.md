@@ -56,14 +56,9 @@ That's the whole idea, applied in both directions:
 
 ```mermaid
 flowchart LR
-  subgraph handoff ["Hand off"]
-    T["bb thread<br>any provider"] -->|event log| D["handoff document<br>transcript + state"]
-    D --> N["new bb thread<br>any provider, any machine"]
-    W["uncommitted work"] -.->|"patch, when the machine changes"| N
-  end
-  subgraph adopt ["Adopt"]
-    S["terminal session<br>Claude Code, Codex,<br>Gemini CLI, OpenCode"] -->|session file| A["bb thread<br>in the same directory"]
-  end
+  T["bb thread<br>any provider"] -->|hand off| D["handoff document<br>transcript + working state"]
+  D --> N["new bb thread<br>any provider, any machine"]
+  S["terminal session<br>Claude Code, Codex,<br>Gemini CLI, OpenCode"] -->|adopt| A["bb thread<br>same directory, full history"]
 ```
 
 ## Hand off: bb thread to any agent
