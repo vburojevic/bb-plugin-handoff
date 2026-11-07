@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { resolveProjectCwd } from "../adopt/adopt-core";
 import { runAdoptCli } from "../adopt/cli";
 

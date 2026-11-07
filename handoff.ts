@@ -1,7 +1,7 @@
 // Handoff delivery: render the captured session into a markdown handoff
 // document, upload it as a project attachment, and spawn the target-provider
 // thread seeded with it.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { CAPS, captureThread, type CapturedSession, type TranscriptEntry } from "./capture";
 import {
   captureWorkingState,
@@ -98,12 +98,6 @@ export const HISTORY_LIMIT = 100;
 
 export const BRIEFING_TIMEOUT_MS = 90_000;
 
-/**
- * How often the briefing wait re-checks whether the source agent stopped to
- * ask something. Cheap (one local query) next to the 90s it saves.
- */
-export const BRIEFING_POLL_MS = 2_000;
-
 const BRIEFING_PROMPT = [
   "This session is being handed off to another agent. Before the transfer, write a handoff briefing for your successor. Reply with only the briefing:",
   "",
@@ -116,40 +110,32 @@ const BRIEFING_PROMPT = [
   "Do not do any further work on the task itself.",
 ].join("\n");
 
-/**
- * Handoffs currently waiting for their source thread's briefing turn to
- * finish. server.ts settles these from its thread.idle / thread.failed
- * listeners.
- */
-const briefingWaiters = new Map<string, (text: string | null) => void>();
-
-export function settleBriefing(threadId: string, text: string | null): void {
-  briefingWaiters.get(threadId)?.(text);
-}
-
-/**
- * Whether the source agent is blocked on the user right now — an approval it
- * needs granted, or a question it asked. bb tracks this outside the thread's
- * status: a blocked run has not settled, so the thread sits at `active` and
- * looks exactly like one still working, and `thread.idle` never arrives.
- * Answering is the user's call, so this only ever reports; it never resolves
- * or cancels the interaction.
- */
-async function blockedOnUser(bb: BbPluginApi, threadId: string): Promise<boolean | null> {
-  try {
-    const interactions = await bb.sdk.threads.interactions.list({ threadId });
-    return interactions.some((interaction) => interaction.status === "pending");
-  } catch {
-    // Can't ask. null, not false: the caller stops polling and falls back to
-    // the timeout rather than re-asking a question that is not being answered.
-    return null;
-  }
-}
-
 /** How the wait for the briefing ended. */
 type BriefingWait =
   | { kind: "answered"; text: string | null }
   | { kind: "blocked" };
+
+/**
+ * Handoffs currently waiting for their source thread's briefing turn to
+ * finish. server.ts settles these from its thread.idle / thread.failed /
+ * interaction.pending listeners.
+ */
+const briefingWaiters = new Map<string, (wait: BriefingWait) => void>();
+
+export function settleBriefing(threadId: string, text: string | null): void {
+  briefingWaiters.get(threadId)?.({ kind: "answered", text });
+}
+
+/**
+ * The source agent stopped to ask the user something — an approval it needs
+ * granted, or a question. bb tracks this outside the thread's status: a
+ * blocked run has not settled, so the thread sits at `active` and
+ * `thread.idle` never arrives. Answering is the user's call, so this only
+ * ends the wait; it never resolves or cancels the interaction.
+ */
+export function blockBriefing(threadId: string): void {
+  briefingWaiters.get(threadId)?.({ kind: "blocked" });
+}
 
 /**
  * Send the briefing prompt to the source thread and wait for its answer.
@@ -176,29 +162,12 @@ async function requestBriefing(
     return { text: null, outcome: "skipped-busy" };
   }
 
-  let done = false;
   let settle!: (value: BriefingWait) => void;
   const waited = new Promise<BriefingWait>((resolve) => {
     settle = resolve;
   });
-  briefingWaiters.set(threadId, (text) => settle({ kind: "answered", text }));
+  briefingWaiters.set(threadId, settle);
   const timer = setTimeout(() => settle({ kind: "answered", text: null }), BRIEFING_TIMEOUT_MS);
-
-  // Self-scheduling rather than an interval: one slow lookup must not stack up
-  // behind itself, and nothing may outlive the wait.
-  let pollTimer: ReturnType<typeof setTimeout> | undefined;
-  const pollForBlock = () => {
-    pollTimer = setTimeout(async () => {
-      if (done) return;
-      const blocked = await blockedOnUser(bb, threadId);
-      if (blocked === null) {
-        bb.log.warn(`briefing: could not read pending interactions for ${threadId}`);
-        return;
-      }
-      if (blocked) settle({ kind: "blocked" });
-      else if (!done) pollForBlock();
-    }, BRIEFING_POLL_MS);
-  };
 
   try {
     await bb.sdk.threads.send({
@@ -206,7 +175,6 @@ async function requestBriefing(
       mode: "auto",
       input: [{ type: "text", text: BRIEFING_PROMPT, mentions: [] }],
     });
-    pollForBlock();
     const result = await waited;
     if (result.kind === "blocked") return { text: null, outcome: "skipped-blocked" };
     return {
@@ -216,9 +184,7 @@ async function requestBriefing(
   } catch {
     return { text: null, outcome: "skipped-unanswered" };
   } finally {
-    done = true;
     clearTimeout(timer);
-    if (pollTimer !== undefined) clearTimeout(pollTimer);
     briefingWaiters.delete(threadId);
   }
 }

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import {
-  BRIEFING_POLL_MS,
+  blockBriefing,
   HISTORY_LIMIT,
   settleBriefing,
   settleVerification,
@@ -78,29 +78,16 @@ function makeFakeBb(
           record("threads.send", args);
           if (options.briefingAsksQuestion) {
             // The agent stops to ask instead of answering: the thread stays
-            // active, so no idle ever arrives for this turn.
+            // active, so no idle ever arrives for this turn. bb announces the
+            // question with interaction.pending, which server.ts forwards.
             blocked = true;
+            queueMicrotask(() => blockBriefing("thr_src"));
             return;
           }
           // The briefing turn "completes" right after the send resolves.
           queueMicrotask(() =>
             settleBriefing("thr_src", options.briefingReply ?? "Briefing: step one is done."),
           );
-        },
-        interactions: {
-          list: async (args: unknown) => {
-            record("threads.interactions.list", args);
-            return blocked
-              ? [
-                  {
-                    id: "int_1",
-                    threadId: "thr_src",
-                    status: "pending",
-                    payload: { kind: "user_question" },
-                  },
-                ]
-              : [];
-          },
         },
         events: {
           list: async (args: { afterSeq?: string }) => {
@@ -392,13 +379,11 @@ describe("startHandoff", () => {
         workspace: "reuse",
         briefing: true,
       });
-      // Well short of BRIEFING_TIMEOUT_MS: the point is that it does not sit
-      // there for the full 90s waiting on a turn that cannot finish.
-      for (let tick = 0; tick < 5; tick++) await vi.advanceTimersByTimeAsync(BRIEFING_POLL_MS);
+      // No timer is advanced: the handoff must not sit there for the full
+      // BRIEFING_TIMEOUT_MS waiting on a turn that cannot finish.
       const result = await running;
 
       expect(result.briefing).toBe("skipped-blocked");
-      expect(calls.some((call) => call.method === "threads.interactions.list")).toBe(true);
       // The question is the user's to answer — the handoff only reports it.
       expect(calls.some((call) => call.method.startsWith("threads.interactions.cancel"))).toBe(false);
 

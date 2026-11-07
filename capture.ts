@@ -1,7 +1,7 @@
 // Session capture: page a thread's event log and project it into a
 // provider-independent transcript, plus locate the provider's native session
 // file (Claude Code / Codex) for raw-fidelity reference.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
 export const CAPS = {
   reasoning: 2_000,

@@ -2,7 +2,7 @@
 // is a lie: the files the agent reads about are on a disk it cannot see. These
 // tests pin down what travels and what the document promises.
 import { describe, expect, it } from "vitest";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { CapturedSession } from "./capture";
 import { renderHandoff, startHandoff } from "./handoff";
 import type { TransferPlan, WorkingState } from "./machines";
@@ -55,27 +55,40 @@ function makeFakeBb(options: { dirty?: boolean; patchWritable?: boolean } = {}) 
       },
       environments: {
         get: async () => ({ hostId: MAC.id, path: "/Users/dev/Git/aurora", branchName: "feature-x" }),
-        status: async () => ({
-          outcome: "available",
-          workspace: {
-            workingTree: {
-              insertions: options.dirty ? 40 : 0,
-              deletions: options.dirty ? 4 : 0,
-              files,
-              hasUncommittedChanges: Boolean(options.dirty),
-              state: options.dirty ? "dirty_uncommitted" : "clean",
-            },
-            checkout: { kind: "branch", branchName: "feature-x", headSha: "abc123def4567890" },
-          },
-        }),
-        diffPatch: async (args: unknown) => {
-          record("environments.diffPatch", args);
-          return {
+      },
+      plugins: {
+        callRpc: async (args: {
+          pluginId: string;
+          method: string;
+          input: unknown;
+          outputSchema: { parse(value: unknown): unknown };
+        }) => {
+          record(`${args.pluginId}.${args.method}`, args.input);
+          if (args.method === "workspaceStatus") {
+            return args.outputSchema.parse({
+              outcome: "available",
+              workspace: {
+                workingTree: {
+                  insertions: options.dirty ? 40 : 0,
+                  deletions: options.dirty ? 4 : 0,
+                  files,
+                  hasUncommittedChanges: Boolean(options.dirty),
+                  state: options.dirty ? "dirty_uncommitted" : "clean",
+                },
+                checkout: { kind: "branch", branchName: "feature-x", headSha: "abc123def4567890" },
+              },
+            });
+          }
+          return args.outputSchema.parse({
             outcome: "available",
-            patches: [
-              { path: "src/exporter.ts", patch: "--- a/src/exporter.ts\n+++ b/src/exporter.ts\n", truncated: false },
-            ],
-          };
+            diff: {
+              diff: "--- a/src/exporter.ts\n+++ b/src/exporter.ts\n",
+              truncated: false,
+              shortstat: " 1 file changed, 40 insertions(+), 4 deletions(-)",
+              files: "src/exporter.ts",
+              mergeBaseRef: null,
+            },
+          });
         },
       },
       files: {
@@ -223,7 +236,7 @@ describe("startHandoff across machines", () => {
     });
     expect(result.crossMachine).toBe(false);
     expect(calls.some((call) => call.method === "files.write")).toBe(false);
-    expect(calls.some((call) => call.method === "environments.diffPatch")).toBe(false);
+    expect(calls.some((call) => call.method.startsWith("bb--git."))).toBe(false);
   });
 
   it("refuses to reuse the source environment on another machine", async () => {

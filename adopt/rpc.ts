@@ -1,7 +1,7 @@
 // RPC surface of the adopt direction, merged into the plugin's single
 // contract in server.ts. Method names are namespaced under no prefix because
 // they don't collide with the handoff methods.
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { listMachines, matchMachine, type Machine } from "../machines";
 import {
