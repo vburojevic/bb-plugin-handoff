@@ -1,11 +1,18 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { findRemoteSession, readRemoteSession } from "../adopt/remote";
 import { listRemoteSessionsForDirectory, performAdoptRemote } from "../adopt/adopt-core";
+
+const LOGIN_SHELL = existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh";
+
+/** The script hostExec hands to /bin/sh, with the outer quoting undone. */
+function innerScript(command: string): string {
+  return execFileSync("/bin/sh", ["-c", `printf %s ${command.slice("/bin/sh -c ".length)}`], { encoding: "utf8" });
+}
 
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
@@ -14,9 +21,16 @@ function remote(home: string, entries: string[] = [], probe: string | null = hom
   let output = "";
   const outputs: string[] = [];
   const create = vi.fn(async ({ start }: { start: { command: string } }) => {
-    // Execute the discovery script, but keep hostExec's temporary output in memory.
-    const script = start.command.slice(2, start.command.indexOf(" ; } >"));
-    output = script.includes('"$HOME"') ? (probe ?? "") : execFileSync("sh", ["-c", script], { encoding: "utf8" });
+    if (start.command.includes('"$HOME"')) {
+      output = probe ?? "";
+    } else {
+      // Run the command the way bb's host daemon does: through the login shell,
+      // which on macOS is zsh, where an unmatched glob is an error.
+      execFileSync(LOGIN_SHELL, ["-c", start.command], { encoding: "utf8" });
+      const out = /\/tmp\/bb-handoff-remote-\d+-\d+\.out/.exec(start.command)![0];
+      output = readFileSync(out, "utf8");
+      rmSync(out, { force: true });
+    }
     outputs.push(output);
     return { id: "terminal" };
   });
@@ -141,7 +155,7 @@ describe("remote home discovery", () => {
       { sources: [{ hostId: "remote", path: "/home/fallback/work" }] },
     ] as Awaited<ReturnType<typeof bb.sdk.projects.list>>);
     expect(await listRemoteSessionsForDirectory(bb, { machine: "remote", cwd: "/work" })).toMatchObject({ sessions: [], machine: "laptop" });
-    expect(create.mock.calls.at(-1)?.[0].start.command).toContain("'/home/fallback/.claude' '/home/fallback'/.claude[-_.]?*");
+    expect(innerScript(create.mock.calls.at(-1)![0].start.command)).toContain("'/home/fallback/.claude' '/home/fallback'/.claude[-_.]?*");
   });
 
   it.each(["", "relative/path", "/home/user\nnoise"])("reports no-home for invalid probe output %j", async (probe) => {
@@ -151,6 +165,17 @@ describe("remote home discovery", () => {
 });
 
 describe("remote Claude profiles", () => {
+  it("runs its scripts in sh, so a profile-less home works under a zsh login shell", async () => {
+    const home = mkdtempSync(join(tmpdir(), "handoff zsh's-"));
+    roots.push(home);
+    const project = join(home, ".claude/projects/-work");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, `${ID}.jsonl`), transcript(false));
+    const { ctx, create } = remote(home);
+    expect((await findRemoteSession(ctx, ID, "claude")).map((s) => s.filePath)).toEqual([join(project, `${ID}.jsonl`)]);
+    expect(create.mock.calls.at(-1)![0].start.command.startsWith("/bin/sh -c '")).toBe(true);
+  });
+
   function homeWithProfile(profile: string) {
     const home = mkdtempSync(join(tmpdir(), "handoff profile's-"));
     roots.push(home);

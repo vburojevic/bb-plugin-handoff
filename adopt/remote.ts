@@ -63,7 +63,10 @@ export async function hostExec(
 ): Promise<string | null> {
   execCounter += 1;
   const out = `/tmp/bb-handoff-remote-${Date.now()}-${execCounter}.out`;
-  const command = `{ ${script} ; } > ${shellQuote(`${out}.part`)} 2>/dev/null; mv ${shellQuote(`${out}.part`)} ${shellQuote(out)}`;
+  // bb runs a terminal command through the machine's login shell, and on
+  // macOS that is zsh, where a glob that matches nothing aborts the script.
+  // These scripts are POSIX sh, so run them in sh whatever the login shell is.
+  const command = `/bin/sh -c ${shellQuote(`{ ${script} ; } > ${shellQuote(`${out}.part`)} 2>/dev/null; mv ${shellQuote(`${out}.part`)} ${shellQuote(out)}`)}`;
   let terminalId: string | null = null;
   try {
     const terminal = await bb.sdk.terminals.create({
