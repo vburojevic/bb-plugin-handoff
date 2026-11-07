@@ -204,9 +204,36 @@ describe("Pi transcript", () => {
   it("rejects invalid headers, unknown versions and broken trees rather than mixing branches", () => {
     expect(() => parsePiContent("{}", FILE)).toThrow("Invalid Pi session header");
     expect(() => parsePiContent(encode([{ ...header, version: 99 }]), FILE)).toThrow("Unsupported Pi session version");
-    expect(() => parsePiContent(encode([header, message("a", "missing", "user", "x")]), FILE)).toThrow("Missing parent");
     expect(() => parsePiContent(encode([header, message("a", "b", "user", "x"), message("b", "a", "user", "y")]), FILE)).toThrow("Cycle");
     expect(() => parsePiContent(encode([header, message("a", null, "user", "x"), message("a", null, "user", "y")]), FILE)).toThrow("Duplicate");
+  });
+
+  it("adopts a forked session whose label entries were dropped, from the fork point on", () => {
+    // Pi's createBranchedSession drops label entries but keeps their children,
+    // so "d" points at a parent ("c") that is not in the file.
+    const session = parsePiContent(encode([
+      header,
+      message("a", null, "user", "Before the fork"),
+      message("b", "a", "assistant", [{ type: "text", text: "Earlier answer" }]),
+      message("d", "c", "user", "After the fork"),
+      message("e", "d", "assistant", [{ type: "text", text: "Forked answer" }]),
+      { type: "label", id: "l", parentId: "e", timestamp: TIMESTAMP, targetId: "e", label: "checkpoint" },
+    ]), FILE);
+    const text = session.transcript;
+    expect(text).toContain("After the fork");
+    expect(text).toContain("Forked answer");
+    expect(text).not.toContain("Before the fork");
+    expect(session.userMessageCount).toBe(1);
+  });
+
+  it("lets an empty session name clear an earlier one", () => {
+    const session = parsePiContent(encode([
+      header,
+      message("a", null, "user", "Fix the parser"),
+      { type: "session_info", id: "n1", parentId: "a", timestamp: TIMESTAMP, name: "Parser work" },
+      { type: "session_info", id: "n2", parentId: "n1", timestamp: TIMESTAMP, name: "" },
+    ]), FILE);
+    expect(session.title).not.toBe("Parser work");
   });
 
   it("uses the shared transcript budget", () => {

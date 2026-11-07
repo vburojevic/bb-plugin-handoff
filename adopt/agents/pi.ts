@@ -80,13 +80,13 @@ async function readInfo(filePath: string, mtimeMs: number): Promise<PiInfo | nul
         }
       } finally { await file.close(); }
     } catch { /* A live session can disappear during discovery. */ }
+    // The last /name wins, and an empty one clears it back to the first request.
+    let named: string | null = null;
     for (const line of tail.split("\n")) {
       const row = parseJsonLine(line);
-      if (row?.type === "session_info" && typeof row.name === "string" && row.name.trim()) {
-        title = row.name;
-      }
+      if (row?.type === "session_info" && typeof row.name === "string") named = row.name.trim() ? row.name : null;
     }
-    return { sessionId: header.id, cwd: header.cwd, title };
+    return { sessionId: header.id, cwd: header.cwd, title: named ?? title };
   });
 }
 
@@ -167,10 +167,10 @@ function activeEntries(rows: Record<string, unknown>[], version: number): Record
     if (seen.has(id)) throw new Error(`Cycle in Pi session tree at ${id}`);
     seen.add(id);
     branch.push(leaf);
-    if (leaf.parentId === null) break;
-    if (typeof leaf.parentId !== "string" || !entries.has(leaf.parentId)) {
-      throw new Error(`Missing parent in Pi session tree at ${id}`);
-    }
+    // A missing parent ends the branch, as in Pi's own buildSessionContext:
+    // forking a session (createBranchedSession) drops label entries but keeps
+    // their children, whose parentId then points at nothing.
+    if (typeof leaf.parentId !== "string") break;
     leaf = entries.get(leaf.parentId);
   }
   return branch.reverse();
@@ -201,7 +201,8 @@ export function parsePiContent(raw: string, filePath: string, options: { maxChar
   let lastTimestamp = typeof header.timestamp === "string" ? header.timestamp : null;
   for (const row of branch) {
     if (typeof row.timestamp === "string") lastTimestamp = row.timestamp;
-    if (row.type === "session_info" && typeof row.name === "string" && row.name.trim()) title = row.name;
+    // An empty name is how Pi clears one (`/name ""`).
+    if (row.type === "session_info" && typeof row.name === "string") title = row.name.trim() ? row.name : null;
     if ((row.type === "compaction" || row.type === "branch_summary") && typeof row.summary === "string") {
       builder.addText("summary", row.summary);
     }
