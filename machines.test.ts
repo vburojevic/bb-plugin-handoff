@@ -227,9 +227,32 @@ describe("captureWorkingState", () => {
     });
   });
 
-  it("carries the truncation flag through from the Git plugin", async () => {
-    const { bb } = makeStatusBb(DIRTY_STATUS, diffResult("diff", true));
-    expect((await captureWorkingState(bb, "env_1"))?.patchTruncated).toBe(true);
+  it("cuts a truncated diff back to the files that fit whole, and names the rest", async () => {
+    const a = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n";
+    const cutB = "diff --git a/src/b.ts b/src/b.ts\nnew file mode 100644\n--- /dev/null\n+++ b/src/b.ts\n@@ -0,0 +1,2 @@\n+line one\n+line t";
+    const { bb } = makeStatusBb(DIRTY_STATUS, diffResult(a + cutB, true));
+    const state = await captureWorkingState(bb, "env_1");
+    expect(state?.patchTruncated).toBe(true);
+    expect(state?.patch).toBe(a);
+    expect(state?.patchOmitted).toEqual(["src/b.ts"]);
+  });
+
+  it("ships no patch when not even the first file fits", async () => {
+    const cutA = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,9 +1,9 @@\n-ol";
+    const { bb } = makeStatusBb(DIRTY_STATUS, diffResult(cutA, true));
+    const state = await captureWorkingState(bb, "env_1");
+    expect(state?.patch).toBeNull();
+    expect(state?.patchOmitted).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(state?.note).toMatch(/larger than the 2 MB patch limit/);
+  });
+
+  it("leaves a complete diff alone", async () => {
+    const a = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n";
+    const { bb } = makeStatusBb(DIRTY_STATUS, diffResult(a + a.replaceAll("a.ts", "b.ts")));
+    const state = await captureWorkingState(bb, "env_1");
+    expect(state?.patchTruncated).toBe(false);
+    expect(state?.patch).toBe(a + a.replaceAll("a.ts", "b.ts"));
+    expect(state?.patchOmitted).toEqual([]);
   });
 
   it("keeps the dirty file list when no patch can be produced", async () => {

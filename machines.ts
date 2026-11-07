@@ -287,7 +287,10 @@ export interface WorkingState {
   deletions: number;
   /** Unified diff of everything uncommitted; null when clean or unavailable. */
   patch: string | null;
+  /** The diff did not fit, so the patch holds only the files that fit whole. */
   patchTruncated: boolean;
+  /** Uncommitted files left out of a truncated patch. */
+  patchOmitted: string[];
   /** Why there is no patch, when there is uncommitted work but no diff. */
   note: string | null;
 }
@@ -337,6 +340,21 @@ const gitDiffSchema = z.union([
 ]);
 
 /**
+ * A diff cut at a byte limit ends mid-hunk, and `git apply` rejects the whole
+ * patch over one broken hunk. Keep only the file sections before the cut, so
+ * the patch still applies and carries every file that fit.
+ */
+export function wholeFilesOnly(diff: string): string {
+  const lastFile = diff.lastIndexOf("\ndiff --git ");
+  return lastFile === -1 ? "" : diff.slice(0, lastFile + 1);
+}
+
+/** Whether a unified diff has a section for this path. */
+function patchCovers(patch: string, path: string): boolean {
+  return patch.includes(`diff --git a/${path} b/`) || patch.includes(` b/${path}\n`);
+}
+
+/**
  * The source workspace's git state, including a patch of everything
  * uncommitted. Cross-machine handoffs need this because the target machine
  * only ever sees what has been pushed.
@@ -373,6 +391,7 @@ export async function captureWorkingState(
     deletions: workingTree.deletions,
     patch: null,
     patchTruncated: false,
+    patchOmitted: [],
     note: null,
   };
   if (!state.dirty) return state;
@@ -389,9 +408,17 @@ export async function captureWorkingState(
       return state;
     }
     const { diff, truncated } = result.diff;
-    state.patch = diff.length > 0 ? (diff.endsWith("\n") ? diff : `${diff}\n`) : null;
+    const kept = truncated ? wholeFilesOnly(diff) : diff;
+    state.patch = kept.length > 0 ? (kept.endsWith("\n") ? kept : `${kept}\n`) : null;
     state.patchTruncated = truncated;
-    if (state.patch === null) state.note = "No diff could be produced for the uncommitted files.";
+    if (truncated) {
+      state.patchOmitted = files.map((file) => file.path).filter((path) => !patchCovers(kept, path));
+    }
+    if (state.patch === null) {
+      state.note = truncated
+        ? `The uncommitted changes are larger than the ${MAX_PATCH_BYTES / 1_000_000} MB patch limit.`
+        : "No diff could be produced for the uncommitted files.";
+    }
   } catch (error) {
     state.note = error instanceof Error ? error.message : String(error);
   }
