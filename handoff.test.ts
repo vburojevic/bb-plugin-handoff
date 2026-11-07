@@ -187,6 +187,20 @@ describe("startHandoff", () => {
     expect(stages).toEqual(["capturing", "rendering", "uploading", "spawning", "done"]);
   });
 
+  it("spawns a personal-workspace handoff in bb's personal project", async () => {
+    const { bb, calls } = makeFakeBb();
+    await startHandoff(bb, { sourceThreadId: "thr_src", providerId: "codex", workspace: "personal" });
+    const upload = calls.find((call) => call.method === "attachments.upload")!.args as { projectId: string };
+    const spawn = calls.find((call) => call.method === "threads.spawn")!.args as {
+      projectId: string;
+      environment: { type: string; workspace: { type: string } };
+    };
+    expect(spawn.environment.workspace).toEqual({ type: "personal" });
+    expect(spawn.projectId).toBe("proj_personal");
+    // bb only lets a thread attach a document uploaded to its own project.
+    expect(upload.projectId).toBe("proj_personal");
+  });
+
   it("passes the requested thinking effort to the target thread", async () => {
     const { bb, calls, kv } = makeFakeBb();
     await startHandoff(bb, {

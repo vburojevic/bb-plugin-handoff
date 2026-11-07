@@ -513,6 +513,18 @@ function resolveEnvironment(plan: TransferPlan, captured: CapturedSession): any 
   return { type: "host", hostId: plan.hostId, workspace: { type: "personal" } };
 }
 
+/**
+ * bb's built-in personal project. bb only creates personal workspaces inside
+ * it, and refuses one in any other project ("Personal workspaces are only
+ * supported for the personal project").
+ */
+export const PERSONAL_PROJECT_ID = "proj_personal";
+
+/** The project the new thread is created in. */
+function targetProjectId(plan: TransferPlan, captured: CapturedSession): string {
+  return plan.workspace === "personal" ? PERSONAL_PROJECT_ID : captured.projectId;
+}
+
 export interface HandoffResult {
   newThreadId: string;
   attachmentPath: string;
@@ -622,9 +634,11 @@ async function runHandoff(
   });
   const bytes = new TextEncoder().encode(doc);
 
+  // The new thread can only attach a document uploaded to its own project.
+  const projectId = targetProjectId(transfer, captured);
   publish("uploading");
   const uploaded = await bb.sdk.projects.attachments.upload({
-    projectId: captured.projectId,
+    projectId,
     clientFile: bytes,
     filename: `handoff-${captured.threadId}-${Date.now()}.md`,
     mimeType: "text/markdown",
@@ -632,7 +646,7 @@ async function runHandoff(
 
   publish("spawning");
   const thread = await bb.sdk.threads.spawn({
-    projectId: captured.projectId,
+    projectId,
     providerId: request.providerId,
     ...(request.model ? { model: request.model } : {}),
     ...(request.reasoningLevel ? { reasoningLevel: request.reasoningLevel } : {}),
