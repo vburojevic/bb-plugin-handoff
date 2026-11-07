@@ -145,7 +145,8 @@ export function buildListScript(home: string, cwd: string, codexScanLimit = 400)
   // "derive it from the path", which only Gemini cannot do.
   return [
     STAT_PRELUDE,
-    `d=${shellQuote(piDir)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'pi\\t\\t'; emit "$f"; }; done; fi`,
+    // Pi folds "/" and "-" into the same folder name, so check each header's cwd.
+    `d=${shellQuote(piDir)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && head -n 1 "$f" | grep -qF ${shellQuote(`"cwd":${JSON.stringify(cwd)}`)} && { printf 'pi\\t\\t'; emit "$f"; }; done; fi`,
     `for c in ${claudeConfigDirs(home)}; do d="$c/projects/"${shellQuote(claudeSlug)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'claude\\t\\t'; emit "$f"; }; done; fi; done`,
     `d=${shellQuote(geminiDir)}; if [ -d "$d" ]; then for f in "$d"/session-*.json; do [ -f "$f" ] || continue; i=$(head -c 400 "$f" | tr -d '\\n' | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1); printf 'gemini\\t%s\\t' "$i"; emit "$f"; done; fi`,
     `d=${shellQuote(codexDir)}; if [ -d "$d" ]; then find "$d" -type f -name 'rollout-*.jsonl' | sort -r | head -n ${codexScanLimit} | while read -r f; do head -c 65536 "$f" | grep -qF ${shellQuote(`"cwd":"${cwd}"`)} && { printf 'codex\\t\\t'; emit "$f"; }; done; fi`,

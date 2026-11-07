@@ -236,6 +236,16 @@ describe("Pi transcript", () => {
     expect(session.title).not.toBe("Parser work");
   });
 
+  it("names the adopted thread after the latest /name, even on another branch", () => {
+    const session = parsePiContent(encode([
+      header,
+      message("a", null, "user", "First ask"),
+      { type: "session_info", id: "n", parentId: "a", timestamp: TIMESTAMP, name: "My name" },
+      message("b", "a", "user", "Branched back and continued"),
+    ]), FILE);
+    expect(session.title).toBe("My name");
+  });
+
   it("uses the shared transcript budget", () => {
     const session = parsePiContent(encode([
       header,

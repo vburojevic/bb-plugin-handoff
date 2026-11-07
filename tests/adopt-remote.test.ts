@@ -79,11 +79,26 @@ describe("remote Pi sessions", () => {
       const cwd = "/Users/dev/It's a repo";
       const dir = path.join(home, ".pi/agent/sessions", piSessionSlug(cwd));
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, file), "{}");
+      fs.writeFileSync(path.join(dir, file), `${JSON.stringify({ type: "session", version: 3, id, cwd })}\n`);
       const output = execFileSync("sh", ["-c", buildListScript(home, cwd)], { encoding: "utf8" });
       expect(parseListOutput(output, cwd)).toEqual([
         expect.objectContaining({ agent: "pi", sessionId: id, filePath: path.join(dir, file), cwd }),
       ]);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it("lists only the sessions recorded for this cwd when two cwds share a Pi folder", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-remote-pi-"));
+    try {
+      // Pi turns both "/tmp/a/b-c" and "/tmp/a-b/c" into the folder "--tmp-a-b-c--".
+      const dir = path.join(home, ".pi/agent/sessions", piSessionSlug("/tmp/a/b-c"));
+      expect(piSessionSlug("/tmp/a-b/c")).toBe(piSessionSlug("/tmp/a/b-c"));
+      fs.mkdirSync(dir, { recursive: true });
+      const other = "99999999-2222-4333-8444-555555555555";
+      fs.writeFileSync(path.join(dir, file), `${JSON.stringify({ type: "session", version: 3, id, cwd: "/tmp/a/b-c" })}\n`);
+      fs.writeFileSync(path.join(dir, `2026-10-01T11-00-00-000Z_${other}.jsonl`), `${JSON.stringify({ type: "session", version: 3, id: other, cwd: "/tmp/a-b/c" })}\n`);
+      const output = execFileSync("sh", ["-c", buildListScript(home, "/tmp/a/b-c")], { encoding: "utf8" });
+      expect(parseListOutput(output, "/tmp/a/b-c").map((s) => s.sessionId)).toEqual([id]);
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 

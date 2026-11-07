@@ -197,12 +197,15 @@ export function parsePiContent(raw: string, filePath: string, options: { maxChar
     }
   }
   const builder = new BlockBuilder();
+  // The session's name is the latest /name anywhere in the file, as in Pi's
+  // getSessionName and this adapter's list; an empty name clears it.
   let title: string | null = null;
+  for (const row of rows) {
+    if (row.type === "session_info" && typeof row.name === "string") title = row.name.trim() ? row.name : null;
+  }
   let lastTimestamp = typeof header.timestamp === "string" ? header.timestamp : null;
   for (const row of branch) {
     if (typeof row.timestamp === "string") lastTimestamp = row.timestamp;
-    // An empty name is how Pi clears one (`/name ""`).
-    if (row.type === "session_info" && typeof row.name === "string") title = row.name.trim() ? row.name : null;
     if ((row.type === "compaction" || row.type === "branch_summary") && typeof row.summary === "string") {
       builder.addText("summary", row.summary);
     }
