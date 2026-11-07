@@ -54,6 +54,18 @@ That's the whole idea, applied in both directions:
 | **Hand off** | a bb thread on any provider                                          | a new thread on any other provider, any enrolled machine |
 | **Adopt**    | a Claude Code, Codex, Gemini or OpenCode session in your terminal    | a bb thread in the same directory, with its history       |
 
+```mermaid
+flowchart LR
+  subgraph handoff ["Hand off"]
+    T["bb thread<br>any provider"] -->|event log| D["handoff document<br>transcript + state"]
+    D --> N["new bb thread<br>any provider, any machine"]
+    W["uncommitted work"] -.->|"patch, when the machine changes"| N
+  end
+  subgraph adopt ["Adopt"]
+    S["terminal session<br>Claude Code, Codex,<br>Gemini CLI, OpenCode"] -->|session file| A["bb thread<br>in the same directory"]
+  end
+```
+
 ## Hand off: bb thread to any agent
 
 Open any thread's right panel (<kbd>⌘</kbd> <kbd>J</kbd>) and add the **Hand off** tab. Pick a target; everything else has a sane default.
@@ -206,15 +218,6 @@ bb handoff adopt list --machine mini --cwd <path>   # …and over there
 
 <details>
 <summary><b>How it works</b></summary>
-
-```mermaid
-flowchart LR
-  T["bb thread<br>any provider"] -->|event log| C["capture.ts<br>transcript"]
-  C --> D["handoff.ts<br>markdown document"]
-  D -->|project attachment| N["new thread<br>target provider"]
-  W["uncommitted work"] -.->|"patch, cross-machine only"| N
-  S["terminal session<br>Claude Code, Codex,<br>Gemini CLI, OpenCode"] -->|adopt/| A["bb thread<br>same directory"]
-```
 
 ```
 capture.ts  handoff.ts   handing off: event-log capture → document → spawn
