@@ -21,8 +21,9 @@ interface Echo {
   start: number;
   end: number;
   body: string;
-  accepted: boolean;
-  /** The note shown for an unconfirmed request, dropped once an echo confirms delivery. */
+  /** Whether the matching provider echo is dropped from the transcript. */
+  drop: boolean;
+  /** The note an echo replaces: an unconfirmed user request the echo proves was delivered. */
   note: TranscriptEntry | null;
   consumed: boolean;
 }
@@ -31,8 +32,9 @@ export interface ProjectedInputs {
   /**
    * Called for each top-level provider user message. Returns true when the
    * message echoes an accepted request already shown from the request events,
-   * so the caller drops it. An echo of an unconfirmed request is kept: it
-   * proves the input reached the model.
+   * so the caller drops it. An echo of an unconfirmed user request is kept as
+   * the user message: it proves the input reached the model. An echo of any
+   * other unconfirmed request is dropped, so it is never shown as user input.
    */
   isEcho(seq: number, body: string): boolean;
   /** Input entries to show. Call after every provider user message went through isEcho. */
@@ -85,13 +87,14 @@ export function projectInputs(rows: EventRowLike[]): ProjectedInputs {
         entries.push({ seq: row.seq, kind: "note", body: `[${data.initiator ?? "unknown"} input${from}]\n${body}` });
       }
       deliveredRoots.add(root);
-      echoes.push({ start: row.seq, end, body, accepted: true, note: null, consumed: false });
+      echoes.push({ start: row.seq, end, body, drop: true, note: null, consumed: false });
     } else {
-      const label = id !== null && rejected.has(id) ? "Rejected" : "Unconfirmed";
+      const isRejected = id !== null && rejected.has(id);
       const note: TranscriptEntry = { seq: row.seq, kind: "note",
-        body: `[${label} input: not known to have reached the source model]\n${body}` };
+        body: `[${isRejected ? "Rejected" : "Unconfirmed"} input: not known to have reached the source model]\n${body}` };
       entries.push(note);
-      echoes.push({ start: row.seq, end, body, accepted: false, note, consumed: false });
+      const keepEcho = data.initiator === "user" && !isRejected;
+      echoes.push({ start: row.seq, end, body, drop: !keepEcho, note: keepEcho ? note : null, consumed: false });
     }
   }
 
@@ -104,7 +107,7 @@ export function projectInputs(rows: EventRowLike[]): ProjectedInputs {
       if (!match) return false;
       match.consumed = true;
       if (match.note) confirmed.add(match.note);
-      return match.accepted;
+      return match.drop;
     },
     entries() {
       return entries.filter((entry) => !confirmed.has(entry));

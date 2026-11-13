@@ -55,6 +55,20 @@ describe("accepted inputs", () => {
     expect(entries.map((e) => [e.kind, e.body])).toEqual([["user", "ship it"]]);
   });
 
+  it("never shows an echo of unconfirmed agent or rejected input as a user message", () => {
+    const entries = projectEvents([
+      request(1, "agent", "child report", "agent"), echo(2, "u1", "child report"),
+      request(3, "rejected", "wrong"),
+      { seq: 4, type: "client/turn/rejected", data: { requestId: "rejected", reason: "busy", message: "busy" } },
+      echo(5, "u2", "wrong"),
+    ]).entries;
+    expect(entries.filter((e) => e.kind === "user")).toHaveLength(0);
+    expect(entries.map((e) => e.body.split("\n")[0])).toEqual([
+      "[Unconfirmed input: not known to have reached the source model]",
+      "[Rejected input: not known to have reached the source model]",
+    ]);
+  });
+
   it("marks unconfirmed and rejected requests as notes, not user instructions", () => {
     const entries = projectEvents([
       request(1, "rejected", "wrong"),

@@ -251,7 +251,7 @@ function renderEntry(entry: TranscriptEntry, sourceProvider: string): string {
     case "plan":
       return `**Proposed plan**${nested}\n\n${entry.body}`;
     case "note":
-      return `> ${entry.body}`;
+      return `> ${entry.body.replaceAll("\n", "\n> ")}`;
   }
 }
 
