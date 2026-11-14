@@ -2,6 +2,7 @@
 // provider-independent transcript, plus locate the provider's native session
 // file (Claude Code / Codex) for raw-fidelity reference.
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { projectInputs, renderInput } from "./capture-inputs";
 
 export const CAPS = {
   reasoning: 2_000,
@@ -67,17 +68,8 @@ function stringifyUnknown(value: unknown, max: number): string {
 function renderItem(item: any): TranscriptEntry | null {
   const nested = Boolean(item.parentToolCallId);
   switch (item.type) {
-    case "userMessage": {
-      const parts: string[] = [];
-      for (const part of item.content ?? []) {
-        if (part.type === "text") parts.push(part.text);
-        else if (part.type === "image") parts.push(`[attached image: ${part.url}]`);
-        else if (part.type === "localImage" || part.type === "localFile") {
-          parts.push(`[attached file: ${part.path}]`);
-        }
-      }
-      return { seq: 0, kind: "user", body: clip(parts.join("\n\n"), CAPS.userMessage), nested };
-    }
+    case "userMessage":
+      return { seq: 0, kind: "user", body: clip(renderInput(item.content), CAPS.userMessage), nested };
     case "agentMessage":
       return { seq: 0, kind: "assistant", body: clip(item.text ?? "", CAPS.assistantMessage), nested };
     case "reasoning": {
@@ -162,6 +154,7 @@ function firstLine(text: string): string {
 /** Project raw thread events into an ordered transcript. Pure. */
 export function projectEvents(rows: EventRowLike[]): ProjectedTranscript {
   const sorted = [...rows].sort((a, b) => a.seq - b.seq);
+  const inputs = projectInputs(sorted);
   const itemOrder: string[] = [];
   // deno-lint-ignore no-explicit-any
   const items = new Map<string, { seq: number; item: any }>();
@@ -213,8 +206,13 @@ export function projectEvents(rows: EventRowLike[]): ProjectedTranscript {
     const record = items.get(id);
     if (!record) continue;
     const entry = renderItem(record.item);
-    if (entry) entries.push({ ...entry, seq: record.seq });
+    if (!entry) continue;
+    // Drop a provider echo of an input already rebuilt from bb's request events.
+    const echo = record.item.type === "userMessage" && !entry.nested &&
+      inputs.isEcho(record.seq, renderInput(record.item.content));
+    if (!echo) entries.push({ ...entry, seq: record.seq });
   }
+  for (const input of inputs.entries()) entries.push({ ...input, body: clip(input.body, CAPS.userMessage) });
   entries.push(...notes);
   entries.sort((a, b) => a.seq - b.seq);
   return { entries, providerThreadId, turns };
@@ -353,19 +351,35 @@ export async function captureThread(
   const rows: EventRowLike[] = [];
   let afterSeq: string | undefined;
   const untilSeq = options?.untilSeq ?? null;
+  // A partial capture anchored at a user message ends at that message's request
+  // event; bb accepts or rejects it a few events later. Keep reading past the
+  // cutoff for those verdicts only, so the input is not shown as unconfirmed.
+  const awaitingVerdict = new Set<string>();
   for (;;) {
     const page = (await bb.sdk.threads.events.list({
       threadId,
       afterSeq,
       limit: String(EVENT_PAGE_SIZE),
     })) as unknown as EventRowLike[];
-    const scoped = untilSeq != null ? page.filter((row) => row.seq <= untilSeq) : page;
-    rows.push(...scoped);
+    for (const row of page) {
+      const verdictFor = row.type === "turn/input/accepted" ? row.data?.clientRequestId
+        : row.type === "client/turn/rejected" ? row.data?.requestId : undefined;
+      if (untilSeq == null || row.seq <= untilSeq) {
+        rows.push(row);
+        if (untilSeq == null) continue;
+        if (row.type === "client/turn/requested" && typeof row.data?.requestId === "string") {
+          awaitingVerdict.add(row.data.requestId);
+        }
+        awaitingVerdict.delete(verdictFor);
+      } else if (awaitingVerdict.delete(verdictFor)) {
+        rows.push(row);
+      }
+    }
     // Stop only on an empty page: the server may cap pages below the requested
     // limit, so a short page does not prove the stream is exhausted.
     if (page.length === 0) break;
-    // A page that reached past the cutoff means nothing relevant comes after.
-    if (untilSeq != null && scoped.length < page.length) break;
+    // Past the cutoff, only verdicts for in-scope requests are still relevant.
+    if (untilSeq != null && page[page.length - 1]!.seq > untilSeq && awaitingVerdict.size === 0) break;
     const lastSeq = page[page.length - 1]!.seq;
     // A cursor that does not advance would page forever.
     if (afterSeq !== undefined && lastSeq <= Number(afterSeq)) {
