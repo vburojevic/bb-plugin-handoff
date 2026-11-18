@@ -90,6 +90,19 @@ describe.skipIf(!hasSqlite3())("OpenCode session_v2 store via the sqlite3 comman
   });
 });
 
+describe("OpenCode compaction rows", () => {
+  it("leaves out the summary while the turns it summarizes are still in session_message", async () => {
+    const { dbPath } = store("v2-only");
+    const session = await opencodeAdapter.parse(`${dbPath}#${V2_ID}`);
+    // The fixture's compaction row follows the first exchange, which stays in full.
+    const prompt = session.transcript.indexOf("Please make the retry test deterministic.");
+    const answer = session.transcript.indexOf("fake the clock");
+    expect(prompt).toBeGreaterThan(-1);
+    expect(answer).toBeGreaterThan(prompt);
+    expect(session.transcript).not.toContain("Summary of the work so far.");
+  });
+});
+
 describe("OpenCode store without the sqlite3 command", () => {
   it("lists, finds and reads sessions in process", async () => {
     const { home, dbPath } = store("mixed");
