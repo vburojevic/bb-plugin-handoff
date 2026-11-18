@@ -6,6 +6,7 @@ import { deriveHomeDir } from "../capture";
 import type { ReasoningLevel } from "../handoff";
 import { listMachines, matchMachine } from "../machines";
 import { ADAPTERS, getAdapter, resolveAgentId } from "./agents";
+import { OPENCODE_SKIPPED_NOTICE, OpencodeReaderMissing } from "./agents/opencode";
 import {
   findRemoteSession,
   hostExec,
@@ -16,10 +17,16 @@ import {
 import type { AgentAdapter, AgentId, FoundSession, ParsedSession } from "./transcript";
 import type { SessionSummary } from "./transcript";
 
+/**
+ * Every adoptable session for a directory. An agent whose store this machine
+ * cannot read is left out of an all-agent listing with a line in `notices`;
+ * asked for by name, it is an error.
+ */
 export async function collectSessions(
   cwd: string,
   agentFilter?: string,
-): Promise<SessionSummary[] | { error: string }> {
+  notices: string[] = [],
+): Promise<SessionSummary[] | { error: string; code?: string }> {
   let adapters = ADAPTERS;
   if (agentFilter) {
     const id = resolveAgentId(agentFilter);
@@ -28,9 +35,20 @@ export async function collectSessions(
     }
     adapters = [getAdapter(id)];
   }
-  const sessions = (await Promise.all(adapters.map((adapter) => adapter.list(cwd)))).flat();
-  sessions.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
-  return sessions;
+  try {
+    const sessions = (await Promise.all(adapters.map((adapter) =>
+      adapter.list(cwd).catch((error: unknown) => {
+        if (agentFilter || !(error instanceof OpencodeReaderMissing)) throw error;
+        notices.push(OPENCODE_SKIPPED_NOTICE);
+        return [];
+      }),
+    ))).flat();
+    sessions.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
+    return sessions;
+  } catch (error) {
+    if (error instanceof OpencodeReaderMissing) return { error: error.message, code: "read-failed" };
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +126,11 @@ export async function locateSessions(
   }
   const adapters = agentHint ? [getAdapter(agentHint)] : ADAPTERS;
   const found = (await Promise.all(adapters.map((adapter) =>
-    adapter.find(sessionId, { cwdCandidates: [...cwdCandidates] }),
+    adapter.find(sessionId, { cwdCandidates: [...cwdCandidates] }).catch((error: unknown) => {
+      // Searching every store: one that cannot be read here holds no match.
+      if (agentHint || !(error instanceof OpencodeReaderMissing)) throw error;
+      return [];
+    }),
   ))).flat();
   found.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
   return found;
@@ -432,7 +454,7 @@ export async function performAdopt(bb: BbPluginApi, options: AdoptOptions): Prom
     return { ok: false, code: "bad-cwd", message: `Directory does not exist on the bb server machine: ${cwd}` };
   }
   const collected = await collectSessions(cwd, options.agent);
-  if ("error" in collected) return { ok: false, code: "bad-agent", message: collected.error };
+  if ("error" in collected) return { ok: false, code: collected.code ?? "bad-agent", message: collected.error };
   if (collected.length === 0) {
     return { ok: false, code: "no-sessions", message: `No agent sessions found for ${cwd}` };
   }
@@ -485,7 +507,13 @@ export async function performAdoptQuery(
         'No session id found in that input. Paste the id itself, or a resume command like "claude --resume <id>" / "codex resume <id>".',
     };
   }
-  const matches = await locateSessions(bb, parsed.sessionId, parsed.agentHint);
+  let matches: FoundSession[];
+  try {
+    matches = await locateSessions(bb, parsed.sessionId, parsed.agentHint);
+  } catch (error) {
+    if (!(error instanceof OpencodeReaderMissing)) throw error;
+    return { ok: false, code: "read-failed", message: error.message };
+  }
   if (matches.length === 0) {
     return {
       ok: false,
@@ -619,6 +647,8 @@ export interface RemoteListResult {
   machine: string;
   sessions: FoundSession[];
   error?: string;
+  /** Stores left out of the listing, one line each; the sessions still stand. */
+  notices?: string[];
 }
 
 /** `bb handoff adopt list --machine <host> --cwd <path>`. */
@@ -629,12 +659,14 @@ export async function listRemoteSessionsForDirectory(
   const resolved = await resolveRemoteContext(bb, options.machine, options.home);
   if (!resolved.ok) return { error: resolved.outcome.message ?? "Unknown machine." };
   if (resolved.local) {
-    const collected = await collectSessions(options.cwd, options.agent);
+    const notices: string[] = [];
+    const collected = await collectSessions(options.cwd, options.agent, notices);
     if ("error" in collected) return { error: collected.error };
     return {
       cwd: options.cwd,
       machine: options.machine,
       sessions: collected.map((session) => ({ ...session, cwd: options.cwd })),
+      ...(notices.length ? { notices } : {}),
     };
   }
   let agentFilter: AgentId | null = null;
@@ -644,11 +676,15 @@ export async function listRemoteSessionsForDirectory(
       return { error: `Unknown agent "${options.agent}". Supported: claude, codex, gemini, opencode, pi.` };
     }
   }
-  const { sessions, execFailed } = await listRemoteSessions(resolved.ctx, options.cwd, agentFilter);
+  const { sessions, execFailed, opencodeUnreadable } = await listRemoteSessions(resolved.ctx, options.cwd, agentFilter);
+  const notices = opencodeUnreadable && (!agentFilter || agentFilter === "opencode")
+    ? [`Could not read OpenCode sessions on ${resolved.ctx.hostName}: is sqlite3 installed there?`]
+    : [];
   return {
     cwd: options.cwd,
     machine: resolved.ctx.hostName,
     sessions,
+    ...(notices.length ? { notices } : {}),
     ...(execFailed
       ? {
           error: `Could not run the session scan on ${resolved.ctx.hostName}. Adoption by session id still works.`,

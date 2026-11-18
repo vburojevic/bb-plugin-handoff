@@ -46,6 +46,19 @@ function isInjectedUserText(text: string): boolean {
 
 type Rows = Record<string, unknown>[];
 
+/** Neither a sqlite3 command nor node:sqlite: this machine cannot read the store. */
+export class OpencodeReaderMissing extends Error {
+  constructor() {
+    super(
+      "Reading OpenCode sessions needs the sqlite3 command on PATH or a Node.js runtime with node:sqlite (22.5 or newer).",
+    );
+    this.name = "OpencodeReaderMissing";
+  }
+}
+
+/** What a listing of every agent says when it had to leave OpenCode out. */
+export const OPENCODE_SKIPPED_NOTICE = "OpenCode sessions skipped: no sqlite3 or node:sqlite available";
+
 /**
  * Run a read-only query; returns [] when the db is absent or the query fails.
  * Without a sqlite3 command it reads in process, and says so when it cannot.
@@ -82,9 +95,7 @@ async function queryInProcess(dbPath: string, sql: string): Promise<Rows> {
   try {
     sqlite = await import("node:sqlite");
   } catch {
-    throw new Error(
-      "Reading OpenCode sessions needs the sqlite3 command on PATH or a Node.js runtime with node:sqlite (22.5 or newer).",
-    );
+    throw new OpencodeReaderMissing();
   }
   try {
     const db = new sqlite.DatabaseSync(dbPath, { readOnly: true });

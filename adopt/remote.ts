@@ -124,6 +124,9 @@ function opencodeJsonLine(sql: string | null): string {
   return sql ? `sqlite3 -readonly -json "$db" ${shellQuote(sql)} | tr -d '\\n'; printf '\\n'` : `printf '[]\\n'`;
 }
 
+/** The line a listing prints when OpenCode's db exists but sqlite3 does not. */
+const OPENCODE_NO_SQLITE3 = "opencode\t\tno-sqlite3";
+
 /** stat(1) differs between BSD and GNU; probe once, then emit `mtime|size|path`. */
 const STAT_PRELUDE =
   'if stat -f %m . >/dev/null 2>&1; then S="-f %m|%z|%N"; else S="-c %Y|%s|%n"; fi; ' +
@@ -172,10 +175,10 @@ export function buildListScript(home: string, cwd: string, codexScanLimit = 400)
     `for c in ${claudeConfigDirs(home)}; do d="$c/projects/"${shellQuote(claudeSlug)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'claude\\t\\t'; emit "$f"; }; done; fi; done`,
     `d=${shellQuote(geminiDir)}; if [ -d "$d" ]; then for f in "$d"/session-*.json; do [ -f "$f" ] || continue; i=$(head -c 400 "$f" | tr -d '\\n' | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1); printf 'gemini\\t%s\\t' "$i"; emit "$f"; done; fi`,
     `d=${shellQuote(codexDir)}; if [ -d "$d" ]; then find "$d" -type f -name 'rollout-*.jsonl' | sort -r | head -n ${codexScanLimit} | while read -r f; do head -c 65536 "$f" | grep -qF ${shellQuote(`"cwd":"${cwd}"`)} && { printf 'codex\\t\\t'; emit "$f"; }; done; fi`,
-    `db=${shellQuote(db)}; if [ -f "$db" ] && command -v sqlite3 >/dev/null 2>&1; then ${opencodeBySchema((schema) => {
+    `db=${shellQuote(db)}; if [ -f "$db" ]; then if command -v sqlite3 >/dev/null 2>&1; then ${opencodeBySchema((schema) => {
       const sql = opencodeListSql(cwd, schema);
       return sql ? `printf 'opencode\\t\\t'; ${opencodeJsonLine(sql)}` : ":";
-    })}; fi`,
+    })}; else printf '%s\\n' ${shellQuote(OPENCODE_NO_SQLITE3)}; fi; fi`,
   ].join("; ");
 }
 
@@ -258,13 +261,14 @@ export async function listRemoteSessions(
   ctx: RemoteContext,
   cwd: string,
   agentFilter?: AgentId | null,
-): Promise<{ sessions: FoundSession[]; execFailed: boolean }> {
+): Promise<{ sessions: FoundSession[]; execFailed: boolean; opencodeUnreadable: boolean }> {
   const output = await hostExec(ctx.bb, ctx.hostId, buildListScript(ctx.home, cwd));
-  if (output === null) return { sessions: [], execFailed: true };
+  if (output === null) return { sessions: [], execFailed: true, opencodeUnreadable: false };
   const sessions = parseListOutput(output, cwd);
   return {
     sessions: agentFilter ? sessions.filter((s) => s.agent === agentFilter) : sessions,
     execFailed: false,
+    opencodeUnreadable: output.split("\n").includes(OPENCODE_NO_SQLITE3),
   };
 }
 
