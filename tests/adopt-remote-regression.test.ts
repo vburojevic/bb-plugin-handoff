@@ -4,8 +4,18 @@ import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { findRemoteSession, readRemoteSession } from "../adopt/remote";
+import { findRemoteSession, listRemoteSessions, readRemoteSession } from "../adopt/remote";
+import { CWD as OPENCODE_CWD, LEGACY_ID, MIGRATED_ID, seedOpencodeStore, V2_ID } from "./opencode-fixture";
 import { listRemoteSessionsForDirectory, performAdoptRemote } from "../adopt/adopt-core";
+
+function sqlite3Available(): boolean {
+  try {
+    execFileSync("sqlite3", ["-version"], { encoding: "utf8" });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const LOGIN_SHELL = existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh";
 
@@ -211,5 +221,35 @@ describe("remote Claude profiles", () => {
     const listed = await listRemoteSessionsForDirectory(remote(home).bb, { machine: "remote", cwd: "/work", home });
     expect(listed).toMatchObject({ sessions: [{ filePath: file }] });
     expect((listed as { sessions: unknown[] }).sessions).toHaveLength(1);
+  });
+});
+
+describe.skipIf(!sqlite3Available())("remote OpenCode stores (issue #21)", () => {
+  function opencodeHome(shape: "v2-only" | "mixed") {
+    const home = mkdtempSync(join(tmpdir(), "handoff opencode's-"));
+    roots.push(home);
+    seedOpencodeStore(home, shape);
+    return home;
+  }
+
+  it("lists, finds and reads a session that only exists in session_v2", async () => {
+    const { ctx } = remote(opencodeHome("v2-only"));
+    const listed = await listRemoteSessions(ctx, OPENCODE_CWD, "opencode");
+    expect(listed.sessions.map((s) => s.sessionId)).toEqual([V2_ID]);
+    const found = await findRemoteSession(ctx, "ses_v2conv", "opencode");
+    expect(found).toMatchObject([{ sessionId: V2_ID, cwd: OPENCODE_CWD }]);
+    const session = await readRemoteSession(ctx, found[0]!);
+    expect(session).toMatchObject({ sessionId: V2_ID, userMessageCount: 2, assistantMessageCount: 2 });
+    expect(session.transcript).toContain("npm test -- retry");
+  });
+
+  it("reads new, migrated and legacy-only sessions of an upgraded store", async () => {
+    const { ctx } = remote(opencodeHome("mixed"));
+    const listed = await listRemoteSessions(ctx, OPENCODE_CWD, "opencode");
+    expect(listed.sessions.map((s) => s.sessionId)).toEqual([V2_ID, MIGRATED_ID, LEGACY_ID]);
+    for (const [id, text] of [[V2_ID, "Added a test for the cap."], [MIGRATED_ID, "The retry helper races."], [LEGACY_ID, "Renamed it."]] as const) {
+      const [found] = await findRemoteSession(ctx, id, "opencode");
+      expect((await readRemoteSession(ctx, found!)).transcript).toContain(text);
+    }
   });
 });
