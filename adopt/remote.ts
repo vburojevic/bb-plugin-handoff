@@ -14,11 +14,13 @@ import { parseCodexContent } from "./agents/codex";
 import { geminiChatsDir, parseGeminiContent } from "./agents/gemini";
 import { parsePiContent, piSessionSlug } from "./agents/pi";
 import {
+  OPENCODE_SCHEMA_SQL,
   opencodeDbPath,
   opencodeFindSql,
   opencodeListSql,
   opencodeSql,
   parseOpencodeRows,
+  type OpencodeSchema,
   type SessionRow,
 } from "./agents/opencode";
 import type { AgentId, FoundSession, ParsedSession, SessionSummary } from "./transcript";
@@ -102,6 +104,29 @@ export async function hostExec(
   }
 }
 
+/**
+ * sh that asks sqlite3 which OpenCode schemas `$db` holds, then runs the arm
+ * for that schema: the same choice the local reader makes, in one round trip.
+ */
+function opencodeBySchema(arm: (schema: OpencodeSchema) => string): string {
+  const shapes: [string, OpencodeSchema][] = [
+    ["11", { v2: true, legacy: true }],
+    ["10", { v2: true, legacy: false }],
+    ["01", { v2: false, legacy: true }],
+    ["*", { v2: false, legacy: false }],
+  ];
+  const arms = shapes.map(([flags, schema]) => `${flags}) ${arm(schema)} ;;`).join(" ");
+  return `s=$(sqlite3 -readonly -noheader -list -separator '|' "$db" ${shellQuote(OPENCODE_SCHEMA_SQL)} | tr -d '|'); case "$s" in ${arms} esac`;
+}
+
+/** sh that prints one query's rows as a single JSON line. */
+function opencodeJsonLine(sql: string | null): string {
+  return sql ? `sqlite3 -readonly -json "$db" ${shellQuote(sql)} | tr -d '\\n'; printf '\\n'` : `printf '[]\\n'`;
+}
+
+/** The line a listing prints when OpenCode's db exists but sqlite3 does not. */
+const OPENCODE_NO_SQLITE3 = "opencode\t\tno-sqlite3";
+
 /** stat(1) differs between BSD and GNU; probe once, then emit `mtime|size|path`. */
 const STAT_PRELUDE =
   'if stat -f %m . >/dev/null 2>&1; then S="-f %m|%z|%N"; else S="-c %Y|%s|%n"; fi; ' +
@@ -150,7 +175,10 @@ export function buildListScript(home: string, cwd: string, codexScanLimit = 400)
     `for c in ${claudeConfigDirs(home)}; do d="$c/projects/"${shellQuote(claudeSlug)}; if [ -d "$d" ]; then for f in "$d"/*.jsonl; do [ -f "$f" ] && { printf 'claude\\t\\t'; emit "$f"; }; done; fi; done`,
     `d=${shellQuote(geminiDir)}; if [ -d "$d" ]; then for f in "$d"/session-*.json; do [ -f "$f" ] || continue; i=$(head -c 400 "$f" | tr -d '\\n' | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1); printf 'gemini\\t%s\\t' "$i"; emit "$f"; done; fi`,
     `d=${shellQuote(codexDir)}; if [ -d "$d" ]; then find "$d" -type f -name 'rollout-*.jsonl' | sort -r | head -n ${codexScanLimit} | while read -r f; do head -c 65536 "$f" | grep -qF ${shellQuote(`"cwd":"${cwd}"`)} && { printf 'codex\\t\\t'; emit "$f"; }; done; fi`,
-    `db=${shellQuote(db)}; if [ -f "$db" ] && command -v sqlite3 >/dev/null 2>&1; then printf 'opencode\\t\\t'; sqlite3 -readonly -json "$db" ${shellQuote(opencodeListSql(cwd))} | tr -d '\\n'; printf '\\n'; fi`,
+    `db=${shellQuote(db)}; if [ -f "$db" ]; then if command -v sqlite3 >/dev/null 2>&1; then ${opencodeBySchema((schema) => {
+      const sql = opencodeListSql(cwd, schema);
+      return sql ? `printf 'opencode\\t\\t'; ${opencodeJsonLine(sql)}` : ":";
+    })}; else printf '%s\\n' ${shellQuote(OPENCODE_NO_SQLITE3)}; fi; fi`,
   ].join("; ");
 }
 
@@ -233,13 +261,14 @@ export async function listRemoteSessions(
   ctx: RemoteContext,
   cwd: string,
   agentFilter?: AgentId | null,
-): Promise<{ sessions: FoundSession[]; execFailed: boolean }> {
+): Promise<{ sessions: FoundSession[]; execFailed: boolean; opencodeUnreadable: boolean }> {
   const output = await hostExec(ctx.bb, ctx.hostId, buildListScript(ctx.home, cwd));
-  if (output === null) return { sessions: [], execFailed: true };
+  if (output === null) return { sessions: [], execFailed: true, opencodeUnreadable: false };
   const sessions = parseListOutput(output, cwd);
   return {
     sessions: agentFilter ? sessions.filter((s) => s.agent === agentFilter) : sessions,
     execFailed: false,
+    opencodeUnreadable: output.split("\n").includes(OPENCODE_NO_SQLITE3),
   };
 }
 
@@ -325,7 +354,10 @@ async function findGeminiByExec(ctx: RemoteContext, sessionId: string): Promise<
 
 async function findOpencodeByExec(ctx: RemoteContext, sessionId: string): Promise<SessionRow[]> {
   const db = opencodeDbPath(ctx.home);
-  const script = `db=${shellQuote(db)}; [ -f "$db" ] && command -v sqlite3 >/dev/null 2>&1 && sqlite3 -readonly -json "$db" ${shellQuote(opencodeFindSql(sessionId))} | tr -d '\\n'`;
+  const script = `db=${shellQuote(db)}; if [ -f "$db" ] && command -v sqlite3 >/dev/null 2>&1; then ${opencodeBySchema((schema) => {
+    const sql = opencodeFindSql(sessionId, schema);
+    return sql ? `sqlite3 -readonly -json "$db" ${shellQuote(sql)} | tr -d '\\n'` : ":";
+  })}; fi`;
   const output = await hostExec(ctx.bb, ctx.hostId, script);
   if (!output?.trim()) return [];
   try {
@@ -426,14 +458,14 @@ export async function readRemoteSession(
   const maxChars = options.maxChars ?? 150_000;
   if (session.agent === "opencode") {
     const db = opencodeDbPath(ctx.home);
-    const sql = opencodeSql(session.sessionId);
-    // One exec for all three queries; each result is a single JSON line.
+    // One exec for all four queries; each result is a single JSON line.
     const script = [
       `db=${shellQuote(db)}`,
       `command -v sqlite3 >/dev/null 2>&1 || exit 0`,
-      ...[sql.session, sql.messages, sql.parts].map(
-        (statement) => `sqlite3 -readonly -json "$db" ${shellQuote(statement)} | tr -d '\\n'; printf '\\n'`,
-      ),
+      opencodeBySchema((schema) => {
+        const sql = opencodeSql(session.sessionId, schema);
+        return [sql.session, sql.sessionMessages, sql.messages, sql.parts].map(opencodeJsonLine).join("; ");
+      }),
     ].join("; ");
     const output = await hostExec(ctx.bb, ctx.hostId, script);
     const lines = (output ?? "").split("\n");
@@ -453,7 +485,7 @@ export async function readRemoteSession(
       );
     }
     return parseOpencodeRows(
-      { session: row, messages: decode(lines[1]), parts: decode(lines[2]) },
+      { session: row, sessionMessages: decode(lines[1]), messages: decode(lines[2]), parts: decode(lines[3]) },
       `${db}#${row.id}`,
       { maxChars },
     );

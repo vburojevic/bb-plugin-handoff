@@ -235,10 +235,11 @@ export async function runAdoptCli(
       if (flags.booleans.has("json")) {
         return { exitCode: 0, stdout: JSON.stringify({ ...listing, sessions }, null, 2) };
       }
+      const remoteNotes = noticeLines(listing.notices);
       if (sessions.length === 0) {
         return {
           exitCode: 0,
-          stdout: `No agent sessions found for ${listing.cwd} on ${listing.machine}${listing.error ? `\n${listing.error}` : ""}`,
+          stdout: `No agent sessions found for ${listing.cwd} on ${listing.machine}${listing.error ? `\n${listing.error}` : ""}${remoteNotes}`,
         };
       }
       const lines = sessions.map((session) => {
@@ -248,17 +249,19 @@ export async function runAdoptCli(
       });
       return {
         exitCode: 0,
-        stdout: `Sessions for ${listing.cwd} on ${listing.machine} (newest first):\n${lines.join("\n")}${listing.error ? `\n\n${listing.error}` : ""}\n\nAdopt one with: bb handoff adopt <session-id> --machine ${machine} --cwd ${listing.cwd}`,
+        stdout: `Sessions for ${listing.cwd} on ${listing.machine} (newest first):\n${lines.join("\n")}${listing.error ? `\n\n${listing.error}` : ""}${remoteNotes}\n\nAdopt one with: bb handoff adopt <session-id> --machine ${machine} --cwd ${listing.cwd}`,
       };
     }
-    const collected = await collectSessions(cwd!, flags.values.get("agent"));
+    const notices: string[] = [];
+    const collected = await collectSessions(cwd!, flags.values.get("agent"), notices);
     if ("error" in collected) return { exitCode: 1, stderr: collected.error };
     const sessions = collected.slice(0, take);
     if (flags.booleans.has("json")) {
-      return { exitCode: 0, stdout: JSON.stringify({ cwd, sessions }, null, 2) };
+      return { exitCode: 0, stdout: JSON.stringify({ cwd, sessions, ...(notices.length ? { notices } : {}) }, null, 2) };
     }
+    const notes = noticeLines(notices);
     if (sessions.length === 0) {
-      return { exitCode: 0, stdout: `No agent sessions found for ${cwd}` };
+      return { exitCode: 0, stdout: `No agent sessions found for ${cwd}${notes}` };
     }
     const lines = sessions.map((session) => {
       const age = formatAge(Date.now() - session.modifiedAtMs);
@@ -267,7 +270,7 @@ export async function runAdoptCli(
     });
     return {
       exitCode: 0,
-      stdout: `Sessions for ${cwd} (newest first):\n${lines.join("\n")}\n\nAdopt one with: bb handoff adopt <session-id>`,
+      stdout: `Sessions for ${cwd} (newest first):\n${lines.join("\n")}${notes}\n\nAdopt one with: bb handoff adopt <session-id>`,
     };
   }
 
@@ -367,4 +370,9 @@ export async function runAdoptCli(
     exitCode: 0,
     stdout: `Adopted ${plan.agentLabel} session ${plan.sessionId} → thread ${outcome.threadId}\n  project:  ${plan.projectName}${plan.createdProject ? " (newly created for this directory)" : ""}\n  provider: ${plan.providerId}${plan.providerNote}\n  title:    ${plan.title}${warning}\nOpen it: bb thread open ${outcome.threadId}`,
   };
+}
+
+/** Stores a listing left out, one line each, under the list. */
+function noticeLines(notices: string[] | undefined): string {
+  return notices?.length ? `\n\n${notices.join("\n")}` : "";
 }

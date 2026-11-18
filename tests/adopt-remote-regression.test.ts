@@ -1,11 +1,21 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { findRemoteSession, readRemoteSession } from "../adopt/remote";
+import { findRemoteSession, listRemoteSessions, readRemoteSession } from "../adopt/remote";
+import { CWD as OPENCODE_CWD, LEGACY_ID, MIGRATED_ID, seedOpencodeStore, V2_ID } from "./opencode-fixture";
 import { listRemoteSessionsForDirectory, performAdoptRemote } from "../adopt/adopt-core";
+
+function sqlite3Available(): boolean {
+  try {
+    execFileSync("sqlite3", ["-version"], { encoding: "utf8" });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const LOGIN_SHELL = existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh";
 
@@ -211,5 +221,66 @@ describe("remote Claude profiles", () => {
     const listed = await listRemoteSessionsForDirectory(remote(home).bb, { machine: "remote", cwd: "/work", home });
     expect(listed).toMatchObject({ sessions: [{ filePath: file }] });
     expect((listed as { sessions: unknown[] }).sessions).toHaveLength(1);
+  });
+});
+
+describe.skipIf(!sqlite3Available())("remote OpenCode stores (issue #21)", () => {
+  function opencodeHome(shape: "v2-only" | "mixed") {
+    const home = mkdtempSync(join(tmpdir(), "handoff opencode's-"));
+    roots.push(home);
+    seedOpencodeStore(home, shape);
+    return home;
+  }
+
+  it("lists, finds and reads a session that only exists in session_v2", async () => {
+    const { ctx } = remote(opencodeHome("v2-only"));
+    const listed = await listRemoteSessions(ctx, OPENCODE_CWD, "opencode");
+    expect(listed.sessions.map((s) => s.sessionId)).toEqual([V2_ID]);
+    const found = await findRemoteSession(ctx, "ses_v2conv", "opencode");
+    expect(found).toMatchObject([{ sessionId: V2_ID, cwd: OPENCODE_CWD }]);
+    const session = await readRemoteSession(ctx, found[0]!);
+    expect(session).toMatchObject({ sessionId: V2_ID, userMessageCount: 2, assistantMessageCount: 2 });
+    expect(session.transcript).toContain("npm test -- retry");
+  });
+
+  it("reads new, migrated and legacy-only sessions of an upgraded store", async () => {
+    const { ctx } = remote(opencodeHome("mixed"));
+    const listed = await listRemoteSessions(ctx, OPENCODE_CWD, "opencode");
+    expect(listed.sessions.map((s) => s.sessionId)).toEqual([V2_ID, MIGRATED_ID, LEGACY_ID]);
+    for (const [id, text] of [[V2_ID, "Added a test for the cap."], [MIGRATED_ID, "The retry helper races."], [LEGACY_ID, "Renamed it."]] as const) {
+      const [found] = await findRemoteSession(ctx, id, "opencode");
+      expect((await readRemoteSession(ctx, found!)).transcript).toContain(text);
+    }
+  });
+});
+
+describe("remote OpenCode db without sqlite3 (issue #21)", () => {
+  it("names the machine in a notice and still lists the other agents", async () => {
+    const home = mkdtempSync(join(tmpdir(), "handoff opencode-nosql-"));
+    roots.push(home);
+    seedOpencodeStore(home, "v2-only");
+    const project = join(home, ".claude/projects/-work");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, `${ID}.jsonl`), transcript(false));
+    // A PATH holding every tool the scan uses except sqlite3.
+    const bin = mkdtempSync(join(tmpdir(), "handoff-bin-"));
+    roots.push(bin);
+    for (const tool of ["stat", "head", "grep", "sed", "find", "sort", "tr", "printf", "mv"]) {
+      const real = execFileSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).trim();
+      if (real.startsWith("/")) symlinkSync(real, join(bin, tool));
+    }
+    const previous = process.env.PATH;
+    process.env.PATH = bin;
+    try {
+      const { bb } = remote(home);
+      const result = await listRemoteSessionsForDirectory(bb, { machine: "remote", cwd: "/work", home });
+      expect(result).toMatchObject({
+        sessions: [{ agent: "claude", sessionId: ID }],
+        notices: ["Could not read OpenCode sessions on laptop: is sqlite3 installed there?"],
+      });
+      expect(result).not.toHaveProperty("error");
+    } finally {
+      process.env.PATH = previous;
+    }
   });
 });
